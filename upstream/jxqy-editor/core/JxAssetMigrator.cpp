@@ -1,0 +1,7905 @@
+#include "JxAssetMigrator.h"
+#include "AuthoringMutationGate.h"
+#include "GameProfile.h"
+#include "../../src/Resource/ResourceCatalog.h"
+#include "INIFileEditor.h"
+#include "LegacyTextDecoder.h"
+#include "ScriptConverter.h"
+#include "LuaScriptSyntaxValidator.h"
+#include "MapConverter.h"
+#include "TiledMapConverter.h"
+#include "PicFileEditor.h"
+#include "Util.h"
+
+#include <QDir>
+#include <QDirIterator>
+#include <QCryptographicHash>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QSet>
+#include <QTemporaryDir>
+#include <QTextStream>
+#include <QUuid>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QImage>
+#include <QHash>
+#include <QRegularExpression>
+#include <QtEndian>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <sstream>
+#include <utility>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+QString assetResourceTypeId(AssetResourceType type)
+{
+    switch (type)
+    {
+    case AssetResourceType::All: return QStringLiteral("all");
+    case AssetResourceType::Scripts: return QStringLiteral("scripts");
+    case AssetResourceType::Maps: return QStringLiteral("maps");
+    case AssetResourceType::Images: return QStringLiteral("images");
+    case AssetResourceType::Audio: return QStringLiteral("audio");
+    case AssetResourceType::Other: return QStringLiteral("other");
+    }
+    return QString();
+}
+
+bool parseAssetResourceType(const QString& id, AssetResourceType& type)
+{
+    const QString normalized = id.trimmed().toLower();
+    const QList<AssetResourceType> cliTypes = {
+        AssetResourceType::All,
+        AssetResourceType::Scripts,
+        AssetResourceType::Maps,
+        AssetResourceType::Images,
+        AssetResourceType::Audio
+    };
+    for (AssetResourceType candidate : cliTypes)
+    {
+        if (normalized == assetResourceTypeId(candidate))
+        {
+            type = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+QList<AssetResourceType> assetResourceDomainTypes()
+{
+    return {
+        AssetResourceType::Scripts,
+        AssetResourceType::Maps,
+        AssetResourceType::Images,
+        AssetResourceType::Audio,
+        AssetResourceType::Other
+    };
+}
+
+QString assetMigrationFileActionId(
+    AssetMigrationFileAction action)
+{
+    switch (action)
+    {
+    case AssetMigrationFileAction::Copy:
+        return QStringLiteral("copy");
+    case AssetMigrationFileAction::Convert:
+        return QStringLiteral("convert");
+    case AssetMigrationFileAction::Skip:
+        return QStringLiteral("skip");
+    case AssetMigrationFileAction::Fail:
+        return QStringLiteral("fail");
+    }
+    return QStringLiteral("fail");
+}
+
+namespace
+{
+QString canonicalMigrationPathKey(
+    QString path)
+{
+    path.replace(
+        QLatin1Char('\\'),
+        QLatin1Char('/'));
+    return QDir::cleanPath(path).
+        normalized(
+            QString::NormalizationForm_C).
+        toCaseFolded();
+}
+
+bool isRuntimeEntryJpeg(QString relativePath)
+{
+    relativePath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    while (relativePath.startsWith(QLatin1Char('/')))
+        relativePath.remove(0, 1);
+    relativePath = QDir::cleanPath(relativePath).toLower();
+    if (!relativePath.endsWith(QStringLiteral(".jpg")) &&
+        !relativePath.endsWith(QStringLiteral(".jpeg")))
+    {
+        return false;
+    }
+    return relativePath == QStringLiteral("cover.jpg") ||
+        relativePath == QStringLiteral("cover.jpeg") ||
+        relativePath.startsWith(QStringLiteral("asf/ui/title/")) ||
+        relativePath.startsWith(QStringLiteral("mpc/ui/title/"));
+}
+
+QString replaceJpegExtensionWithPng(QString path)
+{
+    static const QRegularExpression jpegExtension(
+        QStringLiteral("\\.jpe?g$"),
+        QRegularExpression::CaseInsensitiveOption);
+    path.replace(jpegExtension, QStringLiteral(".png"));
+    return path;
+}
+}
+
+QStringList assetMigrationOutputPathCollisionSources(
+    const QList<QPair<QString, QString>>&
+        sourceOutputPaths)
+{
+    QMap<QString, QStringList> ownersByOutput;
+    for (const auto& sourceOutput :
+         sourceOutputPaths)
+    {
+        const QString outputKey =
+            canonicalMigrationPathKey(
+                sourceOutput.second);
+        ownersByOutput[outputKey].append(
+            sourceOutput.first);
+    }
+
+    QSet<QString> collisions;
+    for (auto owners =
+             ownersByOutput.cbegin();
+         owners != ownersByOutput.cend();
+         ++owners)
+    {
+        if (owners->size() < 2)
+            continue;
+        for (const QString& sourcePath :
+             *owners)
+        {
+            collisions.insert(sourcePath);
+        }
+    }
+    QStringList result =
+        collisions.values();
+    result.sort(Qt::CaseSensitive);
+    return result;
+}
+
+namespace
+{
+const char* kMigrationMarkerFileName = ".jxqy_asset_migration_marker";
+
+#if defined(JXQY_EDITOR_ENABLE_TEST_HOOKS)
+JxAssetMigrator::FileSystemFaultInjector& fileSystemFaultInjector()
+{
+    thread_local JxAssetMigrator::FileSystemFaultInjector injector;
+    return injector;
+}
+#endif
+
+bool shouldFailFileSystemOperation(
+    JxAssetMigrator::FileSystemOperation operation,
+    const QString& sourcePath,
+    const QString& targetPath = QString())
+{
+#if defined(JXQY_EDITOR_ENABLE_TEST_HOOKS)
+    const auto& injector = fileSystemFaultInjector();
+    return injector && injector(operation, sourcePath, targetPath);
+#else
+    (void)operation;
+    (void)sourcePath;
+    (void)targetPath;
+    return false;
+#endif
+}
+
+Qt::CaseSensitivity fileSystemPathCaseSensitivity()
+{
+#if defined(Q_OS_WIN)
+    return Qt::CaseInsensitive;
+#else
+    return Qt::CaseSensitive;
+#endif
+}
+
+QString pathWithCanonicalExistingAncestor(const QString& path)
+{
+    QString currentPath = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    QStringList missingParts;
+    QFileInfo currentInfo(currentPath);
+    while (!currentInfo.exists())
+    {
+        const QString fileName = currentInfo.fileName();
+        const QString parentPath = QDir::cleanPath(currentInfo.absolutePath());
+        if (fileName.isEmpty() || parentPath == currentPath)
+            break;
+        missingParts.prepend(fileName);
+        currentPath = parentPath;
+        currentInfo.setFile(currentPath);
+    }
+
+    QString resolvedPath = currentInfo.exists()
+        ? currentInfo.canonicalFilePath()
+        : currentPath;
+    if (resolvedPath.isEmpty())
+        resolvedPath = currentPath;
+    for (const QString& part : missingParts)
+        resolvedPath = QDir(resolvedPath).filePath(part);
+    return QDir::cleanPath(resolvedPath);
+}
+
+QString lowerPathKey(QString path)
+{
+    return canonicalMigrationPathKey(
+        std::move(path));
+}
+
+bool normalizeResourceTypes(const QList<AssetResourceType>& input,
+    QList<AssetResourceType>& normalized)
+{
+    normalized.clear();
+    if (input.isEmpty())
+        return false;
+
+    const bool selectsAll = input.contains(AssetResourceType::All);
+    for (AssetResourceType type : input)
+    {
+        if (type == AssetResourceType::Other)
+            return false;
+        if (type != AssetResourceType::All &&
+            type != AssetResourceType::Scripts &&
+            type != AssetResourceType::Maps &&
+            type != AssetResourceType::Images &&
+            type != AssetResourceType::Audio)
+        {
+            return false;
+        }
+        if (selectsAll && type != AssetResourceType::All)
+            return false;
+    }
+
+    if (selectsAll)
+    {
+        normalized.append(AssetResourceType::All);
+        return true;
+    }
+
+    for (AssetResourceType type : assetResourceDomainTypes())
+    {
+        if (type != AssetResourceType::Other && input.contains(type))
+            normalized.append(type);
+    }
+    return !normalized.isEmpty();
+}
+
+bool isCompleteProjectMigration(const QList<AssetResourceType>& resourceTypes)
+{
+    return resourceTypes.size() == 1 &&
+        resourceTypes.first() == AssetResourceType::All;
+}
+
+bool isLegacyContentAudioPath(const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    return path == "content/sound" || path.startsWith("content/sound/") ||
+        path == "content/music" || path.startsWith("content/music/");
+}
+
+bool isLegacyXnbSound(const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    return path.startsWith("content/sound/") && path.endsWith(".xnb");
+}
+
+// XNA/MonoGame SoundEffectReader stores WAVEFORMATEX, PCM, then loop/duration.
+// Other readers and compressed XNB need a decoder, rather than a byte copy.
+bool decodeLegacyXnbSound(const QString& sourcePath, QByteArray& wav, QString& error)
+{
+    wav.clear();
+    error = QStringLiteral("unsupported or malformed uncompressed Windows XNB v5 PCM sound");
+    QFile source(sourcePath);
+    constexpr qint64 maximumSoundBytes = 64 * 1024 * 1024;
+    if (!source.open(QIODevice::ReadOnly) || source.size() < 10 || source.size() > maximumSoundBytes)
+        return false;
+    const QByteArray data = source.readAll();
+    if (data.size() != source.size() || data.first(5) != QByteArray("XNBw\x05", 5))
+        return false;
+    if ((static_cast<unsigned char>(data[5]) & ~1u) != 0)
+    {
+        error = QStringLiteral("compressed or unsupported XNB flags; sound was not converted");
+        return false;
+    }
+    if (qFromLittleEndian<quint32>(data.constData() + 6) != data.size())
+        return false;
+    qsizetype position = 10;
+    auto readNumber = [&](quint32& number)
+    {
+        number = 0;
+        for (int shift = 0; shift <= 28 && position < data.size(); shift += 7)
+        {
+            const quint32 byte = static_cast<unsigned char>(data[position++]);
+            if (shift == 28 && byte > 15)
+                return false;
+            number |= (byte & 127) << shift;
+            if ((byte & 128) == 0)
+                return true;
+        }
+        return false;
+    };
+    auto readUInt32 = [&](quint32& number)
+    {
+        if (data.size() - position < 4)
+            return false;
+        number = qFromLittleEndian<quint32>(data.constData() + position);
+        position += 4;
+        return true;
+    };
+    auto readBlock = [&](quint32 length, QByteArray& block)
+    {
+        if (length > static_cast<quint32>(data.size() - position))
+            return false;
+        block = data.mid(position, length);
+        position += length;
+        return true;
+    };
+    quint32 number = 0;
+    QByteArray reader;
+    if (!readNumber(number) || number != 1 || !readNumber(number) ||
+        !readBlock(number, reader) ||
+        reader.split(',').first().trimmed() != "Microsoft.Xna.Framework.Content.SoundEffectReader" ||
+        !readUInt32(number) || number != 0 || !readNumber(number) || number != 0 ||
+        !readNumber(number) || number != 1)
+    {
+        return false;
+    }
+    QByteArray format;
+    QByteArray pcm;
+    if (!readUInt32(number) || (number != 16 && number != 18) || !readBlock(number, format) ||
+        !readUInt32(number) || !readBlock(number, pcm) || pcm.isEmpty() || data.size() - position != 12)
+    {
+        return false;
+    }
+    const quint16 tag = qFromLittleEndian<quint16>(format.constData());
+    const quint16 channels = qFromLittleEndian<quint16>(format.constData() + 2);
+    const quint32 rate = qFromLittleEndian<quint32>(format.constData() + 4);
+    const quint32 byteRate = qFromLittleEndian<quint32>(format.constData() + 8);
+    const quint16 alignment = qFromLittleEndian<quint16>(format.constData() + 12);
+    const quint16 bits = qFromLittleEndian<quint16>(format.constData() + 14);
+    if (tag != 1 || (channels != 1 && channels != 2) || (bits != 8 && bits != 16) ||
+        rate == 0 || alignment != channels * bits / 8 ||
+        static_cast<quint64>(rate) * alignment != byteRate || pcm.size() % alignment != 0 ||
+        (format.size() == 18 && qFromLittleEndian<quint16>(format.constData() + 16) != 0))
+    {
+        return false;
+    }
+    const qint32 loopStart = qFromLittleEndian<qint32>(data.constData() + position);
+    const qint32 loopLength = qFromLittleEndian<qint32>(data.constData() + position + 4);
+    const qint32 duration = qFromLittleEndian<qint32>(data.constData() + position + 8);
+    if (loopStart < 0 || loopLength < 0 || duration < 0 ||
+        static_cast<qint64>(loopStart) + loopLength > pcm.size() / alignment)
+    {
+        return false;
+    }
+    if (loopStart != 0 || (loopLength != 0 && loopLength != pcm.size() / alignment))
+    {
+        error = QStringLiteral("XNB partial sample loop requires runtime loop-range support; sound was not converted");
+        return false;
+    }
+    auto appendUInt32 = [&](quint32 value)
+    {
+        const quint32 little = qToLittleEndian(value);
+        wav.append(reinterpret_cast<const char*>(&little), sizeof(little));
+    };
+    wav.append("RIFF", 4);
+    appendUInt32(36 + pcm.size() + pcm.size() % 2);
+    wav.append("WAVEfmt ", 8);
+    appendUInt32(16);
+    wav.append(format.first(16));
+    wav.append("data", 4);
+    appendUInt32(pcm.size());
+    wav.append(pcm);
+    if (pcm.size() % 2 != 0)
+        wav.append('\0');
+    error.clear();
+    return true;
+}
+
+bool hasSamePcmWaveSamples(const QByteArray& convertedWav, const QString& sourcePath)
+{
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::ReadOnly) || source.size() < 12 || source.size() > 64 * 1024 * 1024)
+        return false;
+    const QByteArray data = source.readAll();
+    if (data.size() != source.size() || data.first(4) != "RIFF" || data.mid(8, 4) != "WAVE" ||
+        qFromLittleEndian<quint32>(data.constData() + 4) != data.size() - 8)
+    {
+        return false;
+    }
+    QByteArray format;
+    QByteArray pcm;
+    qsizetype position = 12;
+    while (data.size() - position >= 8)
+    {
+        const QByteArray kind = data.mid(position, 4);
+        const quint32 length = qFromLittleEndian<quint32>(data.constData() + position + 4);
+        position += 8;
+        if (length > static_cast<quint32>(data.size() - position))
+            return false;
+        if (kind == "fmt ")
+        {
+            if (!format.isEmpty() || (length != 16 && length != 18) ||
+                (length == 18 && qFromLittleEndian<quint16>(data.constData() + position + 16) != 0))
+            {
+                return false;
+            }
+            format = data.mid(position, 16);
+        }
+        else if (kind == "data")
+        {
+            if (!pcm.isEmpty() || length == 0)
+                return false;
+            pcm = data.mid(position, length);
+        }
+        position += length + length % 2;
+    }
+    // Keep the original WAV, including cue/LIST metadata, only when every PCM
+    // format field and sample agrees with the decoded XNB.
+    return position == data.size() && format == convertedWav.mid(20, 16) &&
+        pcm == convertedWav.mid(44, qFromLittleEndian<quint32>(convertedWav.constData() + 40));
+}
+
+AssetResourceType resourceTypeForRelativePath(const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    const QString root = path.section('/', 0, 0);
+    if (root == QStringLiteral("script"))
+        return AssetResourceType::Scripts;
+    if (root == QStringLiteral("map"))
+        return AssetResourceType::Maps;
+    if (root == QStringLiteral("asf") || root == QStringLiteral("mpc") ||
+        root == QStringLiteral("img"))
+    {
+        return AssetResourceType::Images;
+    }
+    if (root == QStringLiteral("music") || root == QStringLiteral("sound") ||
+        isLegacyContentAudioPath(path))
+        return AssetResourceType::Audio;
+    return AssetResourceType::Other;
+}
+
+QStringList resourceTypeIds(const QList<AssetResourceType>& resourceTypes)
+{
+    QStringList ids;
+    for (AssetResourceType type : resourceTypes)
+        ids.append(assetResourceTypeId(type));
+    return ids;
+}
+
+void initializeResourceDomainReport(AssetMigrationReport& report,
+    const QList<AssetResourceType>& resourceTypes)
+{
+    report.completeProject = isCompleteProjectMigration(resourceTypes);
+    report.selectedResourceTypes = resourceTypeIds(resourceTypes);
+    for (AssetResourceType domain : assetResourceDomainTypes())
+    {
+        AssetResourceDomainReport domainReport;
+        domainReport.selected = report.completeProject ||
+            resourceTypes.contains(domain);
+        report.resourceDomains.insert(assetResourceTypeId(domain), domainReport);
+    }
+}
+
+AssetResourceDomainReport& domainReportFor(AssetMigrationReport& report,
+    AssetResourceType domain)
+{
+    return report.resourceDomains[assetResourceTypeId(domain)];
+}
+
+void appendFileOutcome(
+    AssetMigrationReport& report,
+    const QString& sourcePath,
+    const QString& outputPath,
+    AssetResourceType domain,
+    AssetMigrationFileAction action,
+    const QString& reason,
+    const QString& message = QString(),
+    bool sourceScan = true,
+    const QString& entryType = QStringLiteral("file"),
+    const QString& outputSha256 = QString())
+{
+    AssetMigrationFileOutcome outcome;
+    outcome.sourcePath = sourcePath;
+    outcome.outputPath = outputPath;
+    outcome.outputSha256 = outputSha256;
+    outcome.domain = assetResourceTypeId(domain);
+    outcome.entryType = entryType;
+    outcome.action = action;
+    outcome.reason = reason;
+    outcome.message = message;
+    outcome.sourceScan = sourceScan;
+    report.fileOutcomes.append(std::move(outcome));
+}
+
+bool isFileSystemLink(const QFileInfo& information)
+{
+    if (information.isSymLink() ||
+        information.isSymbolicLink())
+    {
+        return true;
+    }
+#if QT_VERSION >= QT_VERSION_CHECK(6, 2, 0)
+    if (information.isJunction())
+        return true;
+#endif
+#ifdef Q_OS_WIN
+    const std::wstring nativePath =
+        QDir::toNativeSeparators(
+            information.absoluteFilePath()).
+            toStdWString();
+    const DWORD attributes =
+        GetFileAttributesW(
+            nativePath.c_str());
+    if (attributes !=
+            INVALID_FILE_ATTRIBUTES &&
+        (attributes &
+         FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    {
+        return true;
+    }
+#endif
+    return false;
+}
+
+QString migrationEntryType(
+    const QFileInfo& information)
+{
+    if (isFileSystemLink(information))
+    {
+        return information.isDir()
+            ? QStringLiteral("directory-link")
+            : QStringLiteral("file-link");
+    }
+    return information.isDir()
+        ? QStringLiteral("directory")
+        : QStringLiteral("file");
+}
+
+AssetMigrationFileOutcome* sourceOutcomeForOutput(
+    AssetMigrationReport& report,
+    const QString& outputPath)
+{
+    const QString outputKey = lowerPathKey(outputPath);
+    for (auto outcome = report.fileOutcomes.rbegin();
+         outcome != report.fileOutcomes.rend();
+         ++outcome)
+    {
+        if (outcome->sourceScan &&
+            lowerPathKey(outcome->outputPath) == outputKey)
+        {
+            return &*outcome;
+        }
+    }
+    return nullptr;
+}
+
+void addDomainWrittenFiles(AssetMigrationReport& report,
+    AssetResourceType domain, int previousWrittenFiles)
+{
+    const int writtenFiles = report.writtenFiles - previousWrittenFiles;
+    if (writtenFiles > 0)
+        domainReportFor(report, domain).writtenFiles += writtenFiles;
+}
+
+QStringList publishedPathsForResourceTypes(
+    const QList<AssetResourceType>& resourceTypes)
+{
+    QStringList paths;
+    for (AssetResourceType type : resourceTypes)
+    {
+        switch (type)
+        {
+        case AssetResourceType::Scripts:
+            paths << QStringLiteral("script")
+                  << QStringLiteral("talkindex.txt");
+            break;
+        case AssetResourceType::Maps:
+            paths << QStringLiteral("map");
+            break;
+        case AssetResourceType::Images:
+            paths << QStringLiteral("asf") << QStringLiteral("img") << QStringLiteral("mpc");
+            break;
+        case AssetResourceType::Audio:
+            paths << QStringLiteral("music") << QStringLiteral("sound");
+            break;
+        case AssetResourceType::All:
+        case AssetResourceType::Other:
+            break;
+        }
+    }
+    return paths;
+}
+
+bool isTextExtension(const QString& extension)
+{
+    return extension == "txt" || extension == "ini" ||
+        extension == "npc" || extension == "obj";
+}
+
+bool isRuntimeTextPath(const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    const QString root = path.section('/', 0, 0);
+    if (root == QStringLiteral("ini") ||
+        root == QStringLiteral("script"))
+    {
+        return true;
+    }
+    return !path.contains(QLatin1Char('/')) &&
+        (path == QStringLiteral("game_profile.ini") ||
+         path == QStringLiteral("partneridx.ini") ||
+         path == QStringLiteral("talkindex.txt"));
+}
+
+bool isRuntimeMapPath(const QString& relativePath)
+{
+    return lowerPathKey(relativePath).startsWith(
+        QStringLiteral("map/"));
+}
+
+bool isRawImageExtension(const QString& extension)
+{
+    return extension == "mpc" || extension == "shd" || extension == "asf" ||
+        extension == "pic" || extension == "img";
+}
+
+bool isConvertibleLegacyImageExtension(const QString& extension)
+{
+    return extension == "mpc" || extension == "shd" ||
+        extension == "asf" || extension == "pic";
+}
+
+bool isTopLevelImgPath(const QString& relativePath)
+{
+    const QString normalized = lowerPathKey(relativePath);
+    return normalized == QStringLiteral("img") ||
+        normalized.startsWith(QStringLiteral("img/"));
+}
+
+bool isConvertibleScriptText(const QString& relativePath, const QString& extension)
+{
+    if (extension != "txt")
+        return false;
+
+    QString normalized = lowerPathKey(relativePath);
+    return normalized.startsWith("script/");
+}
+
+bool isOrphanScriptText(const QString& relativePath)
+{
+    QString normalized = lowerPathKey(relativePath);
+    return normalized.startsWith(QString::fromUtf8("script/未找到/")) ||
+        normalized.startsWith(QString::fromUtf8("script/未找到的/"));
+}
+
+bool isLegacyScriptDocumentation(const QString& relativePath)
+{
+    const QString fileName = QFileInfo(relativePath).fileName();
+    return fileName.compare(QString::fromUtf8("Help编写脚本文件.txt"),
+               Qt::CaseInsensitive) == 0 ||
+        fileName.compare(QString::fromUtf8("script错误汇总.txt"),
+            Qt::CaseInsensitive) == 0;
+}
+
+QString joinRelativePath(const QStringList& parts)
+{
+    QString result;
+    for (const QString& part : parts)
+    {
+        if (part.isEmpty())
+            continue;
+        if (!result.isEmpty())
+            result += "/";
+        result += part;
+    }
+    return result;
+}
+
+QString lowercaseAsciiPath(QString path)
+{
+    for (int index = 0; index < path.size(); ++index)
+    {
+        const ushort character = path.at(index).unicode();
+        if (character >= 'A' && character <= 'Z')
+        {
+            path[index] = QChar(
+                static_cast<ushort>(character + ('a' - 'A')));
+        }
+    }
+    return path;
+}
+
+QString appendPath(const QString& base, const QString& relative)
+{
+    QDir dir(base);
+    return QDir::cleanPath(dir.filePath(relative));
+}
+
+bool ensureParentDirectory(const QString& filePath)
+{
+    return QDir().mkpath(QFileInfo(filePath).absolutePath());
+}
+
+QString normalizedRelativePath(QString path)
+{
+    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    while (path.startsWith(QStringLiteral("./")))
+        path.remove(0, 2);
+    return path;
+}
+
+bool isMigrationGeneratedArtifact(const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    return path == QStringLiteral("migration_report.txt") ||
+        path == QStringLiteral("migration_report.json") ||
+        path == QString::fromLatin1(kMigrationMarkerFileName);
+}
+
+// This is the first published JSON migration-marker format. Only increment it
+// after an incompatible format change has actually shipped.
+constexpr int MigrationMarkerSchemaVersion = 1;
+constexpr qint64 MaximumMigrationMarkerBytes =
+    256LL * 1024LL * 1024LL;
+
+struct ManagedOutputDigest
+{
+    QString relativePath;
+    QString sha256;
+};
+
+using ManagedOutputDigestMap =
+    QMap<QString, ManagedOutputDigest>;
+
+bool isLowercaseSha256(const QString& value)
+{
+    if (value.size() != 64)
+        return false;
+    for (const QChar character : value)
+    {
+        if (!character.isDigit() &&
+            (character < QLatin1Char('a') ||
+             character > QLatin1Char('f')))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isSafeManagedOutputRelativePath(
+    const QString& relativePath)
+{
+    const QString normalized =
+        normalizedRelativePath(relativePath);
+    if (normalized.isEmpty() ||
+        QDir::isAbsolutePath(normalized) ||
+        normalized.startsWith(QLatin1Char('/')) ||
+        normalized.contains(QChar::Null))
+    {
+        return false;
+    }
+    const QStringList parts =
+        normalized.split(
+            QLatin1Char('/'),
+            Qt::KeepEmptyParts);
+    for (const QString& part : parts)
+    {
+        if (part.isEmpty() ||
+            part == QStringLiteral(".") ||
+            part == QStringLiteral("..") ||
+            part.contains(QLatin1Char(':')))
+        {
+            return false;
+        }
+    }
+    return !isMigrationGeneratedArtifact(normalized);
+}
+
+bool calculateFileSha256(
+    const QString& filePath,
+    QString& sha256)
+{
+    sha256.clear();
+    const QFileInfo information(filePath);
+    if (!information.exists() ||
+        !information.isFile() ||
+        isFileSystemLink(information))
+    {
+        return false;
+    }
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    QCryptographicHash hash(
+        QCryptographicHash::Sha256);
+    constexpr qint64 ChunkBytes = 1024 * 1024;
+    while (!file.atEnd())
+    {
+        const QByteArray chunk = file.read(ChunkBytes);
+        if (chunk.isEmpty() && !file.atEnd())
+            return false;
+        hash.addData(chunk);
+    }
+    if (file.error() != QFileDevice::NoError)
+        return false;
+    sha256 = QString::fromLatin1(
+        hash.result().toHex());
+    return isLowercaseSha256(sha256);
+}
+
+struct MigrationFallbackRoots
+{
+    QStringList content;
+    QStringList ui;
+};
+
+QString fileSystemPathToQString(
+    const std::filesystem::path& path)
+{
+    if (path.empty())
+        return QString();
+    const std::string utf8 = path.u8string();
+    return QDir::cleanPath(
+        QString::fromUtf8(
+            utf8.data(),
+            static_cast<int>(utf8.size())));
+}
+
+bool resolveMigrationFallbackRoots(
+    const QString& collectionRoot,
+    const QString& candidateRoot,
+    MigrationFallbackRoots& roots,
+    QString& errorMessage)
+{
+    roots = MigrationFallbackRoots();
+    errorMessage.clear();
+
+    RuntimeResource::ResourceCatalogRequest request;
+    request.primaryCollectionRoot =
+        std::filesystem::u8path(
+            collectionRoot.toUtf8().constData());
+    RuntimeResource::SupplementalResourceRoot candidate;
+    candidate.root = std::filesystem::u8path(
+        candidateRoot.toUtf8().constData());
+    candidate.stableEntryKey =
+        "migration.candidate";
+    candidate.sourceTag = "editor-migration";
+    candidate.replacesPrimaryGameId = true;
+    request.supplementalRoots.push_back(
+        std::move(candidate));
+
+    const RuntimeResource::ExactSelectionResult selection =
+        RuntimeResource::resolveResourceCatalogEntrySelection(
+            request,
+            "migration.candidate");
+    if (!selection.succeeded())
+    {
+        errorMessage = QString::fromUtf8(
+            selection.message.data(),
+            static_cast<int>(selection.message.size()));
+        if (errorMessage.isEmpty())
+        {
+            errorMessage = QString::fromUtf8(
+                "无法按运行时规则解析转换资源的基底链");
+        }
+        return false;
+    }
+
+    const QString candidateKey =
+        lowerPathKey(
+            pathWithCanonicalExistingAncestor(
+                candidateRoot));
+    for (const RuntimeResource::ContentRoot& root :
+         selection.selection.orderedContentRoots)
+    {
+        if (root.kind ==
+                RuntimeResource::ContentRootKind::Active ||
+            root.kind ==
+                RuntimeResource::ContentRootKind::Common)
+        {
+            continue;
+        }
+        const QString path =
+            fileSystemPathToQString(root.root);
+        if (!path.isEmpty() &&
+            lowerPathKey(
+                pathWithCanonicalExistingAncestor(path)) !=
+                candidateKey &&
+            !roots.content.contains(
+                path,
+                fileSystemPathCaseSensitivity()))
+        {
+            roots.content.append(path);
+        }
+    }
+    for (const std::filesystem::path& root :
+         selection.selection.orderedUiFallbackRoots)
+    {
+        const QString path =
+            fileSystemPathToQString(root);
+        if (!path.isEmpty() &&
+            lowerPathKey(
+                pathWithCanonicalExistingAncestor(path)) !=
+                candidateKey &&
+            !roots.ui.contains(
+                path,
+                fileSystemPathCaseSensitivity()))
+        {
+            roots.ui.append(path);
+        }
+    }
+    const QString commonRoot =
+        fileSystemPathToQString(
+            selection.selection.commonResourceRoot);
+    if (!commonRoot.isEmpty() &&
+        QDir(commonRoot).exists() &&
+        !roots.ui.contains(
+            commonRoot,
+            fileSystemPathCaseSensitivity()))
+    {
+        roots.ui.append(commonRoot);
+    }
+    return true;
+}
+
+bool isUiMigrationResourcePath(
+    const QString& relativePath)
+{
+    const QString path = lowerPathKey(relativePath);
+    static const QStringList uiRoots = {
+        QStringLiteral("ini/ui"),
+        QStringLiteral("asf/ui"),
+        QStringLiteral("mpc/ui"),
+        QStringLiteral("bmp/ui"),
+        QStringLiteral("image/ui"),
+        QStringLiteral("sound/ui")
+    };
+    for (const QString& root : uiRoots)
+    {
+        if (path == root ||
+            path.startsWith(root + QLatin1Char('/')))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isDependencyDeduplicationCandidate(
+    const QString& relativePath)
+{
+    const QString root =
+        lowerPathKey(relativePath).
+            section(QLatin1Char('/'), 0, 0);
+    static const QSet<QString> resourceRoots = {
+        QStringLiteral("asf"),
+        QStringLiteral("bmp"),
+        QStringLiteral("font"),
+        QStringLiteral("image"),
+        QStringLiteral("img"),
+        QStringLiteral("mpc"),
+        QStringLiteral("music"),
+        QStringLiteral("sound"),
+        QStringLiteral("video")
+    };
+    return resourceRoots.contains(root);
+}
+
+AssetMigrationFileOutcome* outcomeForOutput(
+    AssetMigrationReport& report,
+    const QString& outputPath)
+{
+    const QString outputKey =
+        lowerPathKey(outputPath);
+    for (auto outcome = report.fileOutcomes.rbegin();
+         outcome != report.fileOutcomes.rend();
+         ++outcome)
+    {
+        if (lowerPathKey(outcome->outputPath) ==
+                outputKey &&
+            (outcome->action ==
+                 AssetMigrationFileAction::Copy ||
+             outcome->action ==
+                 AssetMigrationFileAction::Convert))
+        {
+            return &*outcome;
+        }
+    }
+    return nullptr;
+}
+
+bool removeExactDependencyDuplicates(
+    const QString& candidateRoot,
+    const MigrationFallbackRoots& fallbackRoots,
+    QSet<QString>& omittedPathKeys,
+    AssetMigrationReport& report,
+    const JxAssetMigrator::LogCallback& logCallback,
+    QString& errorMessage)
+{
+    omittedPathKeys.clear();
+    errorMessage.clear();
+    const QDir candidateDirectory(candidateRoot);
+    QDirIterator iterator(
+        candidateRoot,
+        QDir::Files |
+            QDir::Hidden |
+            QDir::System,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext())
+    {
+        const QString candidatePath =
+            iterator.next();
+        const QFileInfo candidateInformation =
+            iterator.fileInfo();
+        const QString relativePath =
+            normalizedRelativePath(
+                candidateDirectory.relativeFilePath(
+                    candidatePath));
+        if (!isDependencyDeduplicationCandidate(
+                relativePath) ||
+            isMigrationGeneratedArtifact(relativePath) ||
+            isFileSystemLink(candidateInformation))
+        {
+            continue;
+        }
+
+        const QStringList& roots =
+            isUiMigrationResourcePath(relativePath)
+            ? fallbackRoots.ui
+            : fallbackRoots.content;
+        for (const QString& root : roots)
+        {
+            const QString fallbackPath =
+                appendPath(root, relativePath);
+            const QFileInfo fallbackInformation(
+                fallbackPath);
+            if (!fallbackInformation.exists() &&
+                !isFileSystemLink(fallbackInformation))
+            {
+                continue;
+            }
+            if (!fallbackInformation.isFile() ||
+                isFileSystemLink(fallbackInformation))
+            {
+                // This is the first runtime fallback that owns the path.
+                // Do not skip over an unsafe or non-file entry and compare a
+                // deeper dependency instead.
+                break;
+            }
+            if (fallbackInformation.size() !=
+                candidateInformation.size())
+            {
+                break;
+            }
+
+            QString candidateSha256;
+            QString fallbackSha256;
+            if (!calculateFileSha256(
+                    candidatePath,
+                    candidateSha256) ||
+                !calculateFileSha256(
+                    fallbackPath,
+                    fallbackSha256))
+            {
+                errorMessage = QString::fromUtf8(
+                    "无法读取待查重资源或基底资源: %1")
+                    .arg(relativePath);
+                return false;
+            }
+            if (candidateSha256 != fallbackSha256)
+                break;
+
+            const qint64 duplicateBytes =
+                candidateInformation.size();
+            if (!QFile::remove(candidatePath))
+            {
+                errorMessage = QString::fromUtf8(
+                    "无法从转换候选中省略基底重复资源: %1")
+                    .arg(relativePath);
+                return false;
+            }
+            omittedPathKeys.insert(
+                lowerPathKey(relativePath));
+            report.dependencyDuplicateFiles++;
+            report.dependencyDuplicateBytes +=
+                static_cast<quint64>(
+                    std::max<qint64>(0, duplicateBytes));
+            if (report.writtenFiles > 0)
+                report.writtenFiles--;
+            AssetResourceDomainReport& domain =
+                domainReportFor(
+                    report,
+                    resourceTypeForRelativePath(
+                        relativePath));
+            if (domain.writtenFiles > 0)
+                domain.writtenFiles--;
+
+            AssetMigrationFileOutcome* outcome =
+                outcomeForOutput(
+                    report,
+                    relativePath);
+            const QString message =
+                QString::fromUtf8(
+                    "与运行时首先命中的基底资源完全相同，"
+                    "转换输出省略该文件；基底=%1")
+                    .arg(root);
+            if (outcome)
+            {
+                outcome->action =
+                    AssetMigrationFileAction::Skip;
+                outcome->reason =
+                    QStringLiteral(
+                        "identical-to-dependency");
+                outcome->message = message;
+                outcome->outputSha256.clear();
+            }
+            else
+            {
+                appendFileOutcome(
+                    report,
+                    QStringLiteral(
+                        "<generated:dependency-deduplication>"),
+                    relativePath,
+                    resourceTypeForRelativePath(
+                        relativePath),
+                    AssetMigrationFileAction::Skip,
+                    QStringLiteral(
+                        "identical-to-dependency"),
+                    message,
+                    false);
+            }
+            break;
+        }
+    }
+
+    if (report.dependencyDuplicateFiles > 0)
+    {
+        const QString message = QString::fromUtf8(
+            "基底资源查重: 省略 %1 个完全相同的媒体资源，共 %2 字节。")
+            .arg(report.dependencyDuplicateFiles)
+            .arg(report.dependencyDuplicateBytes);
+        report.logLines.append(message);
+        if (logCallback)
+            logCallback(message);
+    }
+    return true;
+}
+
+ManagedOutputDigestMap readMigrationMarkerProvenance(
+    const QString& outputRoot)
+{
+    ManagedOutputDigestMap result;
+    const QString markerPath =
+        appendPath(
+            outputRoot,
+            QString::fromLatin1(
+                kMigrationMarkerFileName));
+    const QFileInfo markerInformation(markerPath);
+    if (!markerInformation.exists() ||
+        !markerInformation.isFile() ||
+        isFileSystemLink(markerInformation) ||
+        markerInformation.size() < 0 ||
+        markerInformation.size() >
+            MaximumMigrationMarkerBytes)
+    {
+        return result;
+    }
+
+    QFile marker(markerPath);
+    if (!marker.open(QIODevice::ReadOnly))
+        return result;
+    QJsonParseError parseError;
+    const QJsonDocument document =
+        QJsonDocument::fromJson(
+            marker.readAll(),
+            &parseError);
+    if (parseError.error !=
+            QJsonParseError::NoError ||
+        !document.isObject())
+    {
+        return {};
+    }
+
+    const QJsonObject root = document.object();
+    if (root.value(QStringLiteral("format")).
+                toString() !=
+            QStringLiteral(
+                "jxqy-editor-asset-migration-output") ||
+        root.value(QStringLiteral("schemaVersion")).
+                toInt(-1) !=
+            MigrationMarkerSchemaVersion ||
+        root.value(QStringLiteral("hashAlgorithm")).
+                toString() !=
+            QStringLiteral("sha256") ||
+        !root.value(
+                 QStringLiteral(
+                     "managedOutputSha256")).
+                 isObject())
+    {
+        return {};
+    }
+
+    const QJsonObject managedOutputs =
+        root.value(
+                QStringLiteral(
+                    "managedOutputSha256")).
+            toObject();
+    for (auto entry = managedOutputs.begin();
+         entry != managedOutputs.end();
+         ++entry)
+    {
+        const QString relativePath =
+            normalizedRelativePath(entry.key());
+        const QString sha256 =
+            entry.value().toString();
+        const QString pathKey =
+            lowerPathKey(relativePath);
+        if (!isSafeManagedOutputRelativePath(
+                relativePath) ||
+            !isLowercaseSha256(sha256) ||
+            result.contains(pathKey))
+        {
+            return {};
+        }
+        result.insert(
+            pathKey,
+            {relativePath, sha256});
+    }
+    return result;
+}
+
+bool collectManagedOutputDigests(
+    const QString& stagingRoot,
+    ManagedOutputDigestMap& digests)
+{
+    digests.clear();
+    const QDir stagingDirectory(stagingRoot);
+    QDirIterator iterator(
+        stagingRoot,
+        QDir::Files |
+            QDir::Hidden |
+            QDir::System |
+            QDir::NoDotAndDotDot,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext())
+    {
+        const QString filePath = iterator.next();
+        const QFileInfo information = iterator.fileInfo();
+        const QString relativePath =
+            normalizedRelativePath(
+                stagingDirectory.relativeFilePath(
+                    filePath));
+        if (isMigrationGeneratedArtifact(relativePath))
+            continue;
+        if (!isSafeManagedOutputRelativePath(
+                relativePath) ||
+            isFileSystemLink(information))
+        {
+            digests.clear();
+            return false;
+        }
+        QString sha256;
+        if (!calculateFileSha256(
+                filePath,
+                sha256))
+        {
+            digests.clear();
+            return false;
+        }
+        const QString pathKey =
+            lowerPathKey(relativePath);
+        if (digests.contains(pathKey))
+        {
+            digests.clear();
+            return false;
+        }
+        digests.insert(
+            pathKey,
+            {relativePath, sha256});
+    }
+    return true;
+}
+
+ManagedOutputDigestMap mergeManagedOutputDigests(
+    const ManagedOutputDigestMap& previous,
+    const ManagedOutputDigestMap& current,
+    const QSet<QString>& explicitlyOmittedPathKeys)
+{
+    ManagedOutputDigestMap combined = previous;
+    for (const QString& pathKey :
+         explicitlyOmittedPathKeys)
+    {
+        combined.remove(pathKey);
+    }
+    for (auto digest = current.cbegin();
+         digest != current.cend();
+         ++digest)
+    {
+        combined.insert(
+            digest.key(),
+            digest.value());
+    }
+    return combined;
+}
+
+void applyManagedOutputDigestsToReport(
+    AssetMigrationReport& report,
+    const ManagedOutputDigestMap& current,
+    const ManagedOutputDigestMap& combined)
+{
+    report.managedOutputSha256.clear();
+    for (const ManagedOutputDigest& digest :
+         combined)
+    {
+        report.managedOutputSha256.insert(
+            digest.relativePath,
+            digest.sha256);
+    }
+    for (AssetMigrationFileOutcome& outcome :
+         report.fileOutcomes)
+    {
+        const auto digest = current.constFind(
+            lowerPathKey(outcome.outputPath));
+        if (digest != current.cend())
+            outcome.outputSha256 =
+                digest->sha256;
+    }
+}
+
+bool pathIsInPublishedScope(
+    const QString& relativePath,
+    const QStringList& publishedRoots)
+{
+    if (publishedRoots.isEmpty())
+        return true;
+
+    const QString path = lowerPathKey(relativePath);
+    for (QString root : publishedRoots)
+    {
+        root = lowerPathKey(normalizedRelativePath(root));
+        while (root.endsWith(QLatin1Char('/')))
+            root.chop(1);
+        if (!root.isEmpty() &&
+            (path == root ||
+             path.startsWith(root + QLatin1Char('/'))))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct ExistingOutputSnapshotEntry
+{
+    QString relativePath;
+    QString entryType;
+    QString sha256;
+};
+
+struct ExistingOutputSnapshot
+{
+    bool rootExists = false;
+    QMap<QString, ExistingOutputSnapshotEntry> entries;
+};
+
+bool outputEntryExists(const QFileInfo& information)
+{
+    return information.exists() ||
+        isFileSystemLink(information);
+}
+
+bool collectExistingOutputSnapshot(
+    const QString& rootPath,
+    const QStringList& publishedRoots,
+    ExistingOutputSnapshot& snapshot,
+    QString& errorRelativePath,
+    QString& errorMessage)
+{
+    snapshot = ExistingOutputSnapshot();
+    errorRelativePath.clear();
+    errorMessage.clear();
+
+    const QFileInfo rootInformation(rootPath);
+    if (!outputEntryExists(rootInformation))
+        return true;
+    snapshot.rootExists = true;
+    if (isFileSystemLink(rootInformation) ||
+        !rootInformation.isDir())
+    {
+        errorRelativePath = QStringLiteral(".");
+        errorMessage = QString::fromUtf8(
+            "旧输出根不是可安全复核的普通目录");
+        return false;
+    }
+
+    const QDir rootDirectory(rootPath);
+    QDirIterator iterator(
+        rootPath,
+        QDir::AllEntries |
+            QDir::NoDotAndDotDot |
+            QDir::Hidden |
+            QDir::System,
+        QDirIterator::Subdirectories);
+    while (iterator.hasNext())
+    {
+        const QString entryPath = iterator.next();
+        const QFileInfo information = iterator.fileInfo();
+        const QString relativePath =
+            normalizedRelativePath(
+                rootDirectory.relativeFilePath(
+                    entryPath));
+        const bool fileSystemLink =
+            isFileSystemLink(information);
+        if (!pathIsInPublishedScope(
+                relativePath,
+                publishedRoots) &&
+            !isMigrationGeneratedArtifact(
+                relativePath) &&
+            !fileSystemLink)
+        {
+            continue;
+        }
+
+        const QString pathKey =
+            lowerPathKey(relativePath);
+        if (!isSafeManagedOutputRelativePath(
+                relativePath) &&
+            !isMigrationGeneratedArtifact(
+                relativePath))
+        {
+            errorRelativePath = relativePath;
+            errorMessage = QString::fromUtf8(
+                "旧输出包含不安全的相对路径");
+            return false;
+        }
+        if (snapshot.entries.contains(pathKey))
+        {
+            errorRelativePath = relativePath;
+            errorMessage = QString::fromUtf8(
+                "旧输出包含仅大小写不同的冲突路径");
+            return false;
+        }
+
+        ExistingOutputSnapshotEntry entry;
+        entry.relativePath = relativePath;
+        entry.entryType =
+            migrationEntryType(information);
+        if (fileSystemLink)
+        {
+            snapshot.entries.insert(
+                pathKey,
+                std::move(entry));
+            continue;
+        }
+        if (information.isFile())
+        {
+            if (!calculateFileSha256(
+                    entryPath,
+                    entry.sha256))
+            {
+                errorRelativePath = relativePath;
+                errorMessage = QString::fromUtf8(
+                    "无法读取旧输出文件的 SHA-256");
+                return false;
+            }
+        }
+        else if (!information.isDir())
+        {
+            errorRelativePath = relativePath;
+            errorMessage = QString::fromUtf8(
+                "旧输出包含不支持的目录项类型");
+            return false;
+        }
+        snapshot.entries.insert(
+            pathKey,
+            std::move(entry));
+    }
+    return true;
+}
+
+bool compareExistingOutputSnapshots(
+    const ExistingOutputSnapshot& expected,
+    const ExistingOutputSnapshot& actual,
+    bool compareRootExistence,
+    QString& changedRelativePath)
+{
+    changedRelativePath.clear();
+    if (compareRootExistence &&
+        expected.rootExists != actual.rootExists)
+    {
+        changedRelativePath = QStringLiteral(".");
+        return false;
+    }
+
+    for (auto expectedEntry =
+             expected.entries.cbegin();
+         expectedEntry != expected.entries.cend();
+         ++expectedEntry)
+    {
+        const auto actualEntry =
+            actual.entries.constFind(
+                expectedEntry.key());
+        if (actualEntry ==
+                actual.entries.cend() ||
+            actualEntry->relativePath !=
+                expectedEntry->relativePath ||
+            actualEntry->entryType !=
+                expectedEntry->entryType ||
+            actualEntry->sha256 !=
+                expectedEntry->sha256)
+        {
+            changedRelativePath =
+                expectedEntry->relativePath;
+            return false;
+        }
+    }
+    for (auto actualEntry =
+             actual.entries.cbegin();
+         actualEntry != actual.entries.cend();
+         ++actualEntry)
+    {
+        if (!expected.entries.contains(
+                actualEntry.key()))
+        {
+            changedRelativePath =
+                actualEntry->relativePath;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool existingEntryStillMatchesSnapshot(
+    const QString& existingRoot,
+    const ExistingOutputSnapshotEntry& expected)
+{
+    const QString existingPath =
+        appendPath(
+            existingRoot,
+            expected.relativePath);
+    const QFileInfo information(existingPath);
+    if (!outputEntryExists(information) ||
+        isFileSystemLink(information) ||
+        migrationEntryType(information) !=
+            expected.entryType)
+    {
+        return false;
+    }
+    if (information.isDir())
+        return true;
+
+    QString sha256;
+    return calculateFileSha256(
+               existingPath,
+               sha256) &&
+        sha256 == expected.sha256;
+}
+
+bool mergeExistingOutputFiles(
+    const QString& existingRoot,
+    const QString& stagingRoot,
+    const ExistingOutputSnapshot&
+        existingSnapshot,
+    const ManagedOutputDigestMap&
+        previousManagedOutputs,
+    const ManagedOutputDigestMap&
+        currentManagedOutputs,
+    const QSet<QString>&
+        explicitlyOmittedPathKeys,
+    const QStringList&
+        managedPublishedRoots,
+    AssetMigrationReport& report,
+    const JxAssetMigrator::LogCallback& logCallback)
+{
+    if (!existingSnapshot.rootExists)
+        return true;
+
+    bool merged = true;
+    for (auto previous =
+             previousManagedOutputs.cbegin();
+         previous != previousManagedOutputs.cend();
+         ++previous)
+    {
+        if (!pathIsInPublishedScope(
+                previous->relativePath,
+                managedPublishedRoots))
+        {
+            continue;
+        }
+
+        const auto existing =
+            existingSnapshot.entries.constFind(
+                previous.key());
+        if (explicitlyOmittedPathKeys.contains(
+                previous.key()))
+        {
+            if (existing ==
+                    existingSnapshot.entries.cend())
+            {
+                continue;
+            }
+            if (existing->entryType !=
+                    QStringLiteral("file") ||
+                existing->sha256 !=
+                    previous->sha256)
+            {
+                const AssetResourceType domain =
+                    resourceTypeForRelativePath(
+                        previous->relativePath);
+                appendFileOutcome(
+                    report,
+                    previous->relativePath,
+                    previous->relativePath,
+                    domain,
+                    AssetMigrationFileAction::Fail,
+                    QStringLiteral(
+                        "existing-managed-output-modified"),
+                    QString::fromUtf8(
+                        "本代确认该文件与基底完全相同并准备省略，"
+                        "但旧输出与上一代 SHA-256 清单不一致；"
+                        "视为玩家内容冲突并取消发布"),
+                    false,
+                    existing->entryType,
+                    existing->sha256);
+                domainReportFor(
+                    report,
+                    domain).failedFiles++;
+                report.errorCount++;
+                merged = false;
+            }
+            continue;
+        }
+        if (existing ==
+                existingSnapshot.entries.cend())
+        {
+            const auto current =
+                currentManagedOutputs.constFind(
+                    previous.key());
+            const QString outputPath =
+                current ==
+                        currentManagedOutputs.cend()
+                ? previous->relativePath
+                : current->relativePath;
+            const AssetResourceType domain =
+                resourceTypeForRelativePath(
+                    outputPath);
+            appendFileOutcome(
+                report,
+                previous->relativePath,
+                outputPath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-managed-output-deleted"),
+                QString::fromUtf8(
+                    "上一代 SHA-256 清单记录了该受管文件，"
+                    "但旧输出已缺失；视为玩家删除冲突并取消发布"),
+                false,
+                QStringLiteral("file"));
+            domainReportFor(
+                report,
+                domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        if (!currentManagedOutputs.contains(
+                previous.key()) &&
+            (existing->entryType !=
+                 QStringLiteral("file") ||
+             existing->sha256 !=
+                 previous->sha256))
+        {
+            const AssetResourceType domain =
+                resourceTypeForRelativePath(
+                    previous->relativePath);
+            appendFileOutcome(
+                report,
+                previous->relativePath,
+                previous->relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-managed-output-modified"),
+                QString::fromUtf8(
+                    "本代不再生成该受管文件，"
+                    "但旧输出与上一代 SHA-256 清单不一致；"
+                    "视为玩家内容冲突并取消发布"),
+                false,
+                existing->entryType,
+                existing->sha256);
+            domainReportFor(
+                report,
+                domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+        }
+    }
+
+    QHash<QString, QString> stagedPathsByKey;
+    QDir stagingDirectory(stagingRoot);
+    QDirIterator stagedIterator(
+        stagingRoot,
+        QDir::AllEntries |
+            QDir::NoDotAndDotDot |
+            QDir::Hidden |
+            QDir::System,
+        QDirIterator::Subdirectories);
+    while (stagedIterator.hasNext())
+    {
+        const QString path = stagedIterator.next();
+        const QString relativePath = normalizedRelativePath(
+            stagingDirectory.relativeFilePath(path));
+        stagedPathsByKey.insert(
+            lowerPathKey(relativePath),
+            relativePath);
+    }
+
+    int preservedCount = 0;
+    for (const ExistingOutputSnapshotEntry&
+             existingEntry :
+         existingSnapshot.entries)
+    {
+        const QString relativePath =
+            existingEntry.relativePath;
+        if (isMigrationGeneratedArtifact(relativePath))
+            continue;
+        const QString existingPath =
+            appendPath(existingRoot, relativePath);
+        const QFileInfo existingInformation(
+            existingPath);
+        const AssetResourceType domain =
+            resourceTypeForRelativePath(relativePath);
+        const QString entryType =
+            existingEntry.entryType;
+        if (entryType.endsWith(
+                QStringLiteral("-link")))
+        {
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-link-not-supported"),
+                QString::fromUtf8(
+                    "旧输出包含文件系统链接；为避免越界跟随，取消发布"),
+                false,
+                entryType);
+            domainReportFor(
+                report,
+                domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+        if (!existingEntryStillMatchesSnapshot(
+                existingRoot,
+                existingEntry))
+        {
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-output-changed-during-merge"),
+                QString::fromUtf8(
+                    "旧输出在合并期间发生变化，取消发布"),
+                false,
+                entryType);
+            domainReportFor(report, domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        const QString stagedPath =
+            appendPath(stagingRoot, relativePath);
+        const QString pathKey =
+            lowerPathKey(relativePath);
+        const auto previousDigest =
+            previousManagedOutputs.constFind(
+                pathKey);
+        if (explicitlyOmittedPathKeys.contains(
+                pathKey) &&
+            previousDigest !=
+                previousManagedOutputs.cend() &&
+            existingEntry.entryType ==
+                QStringLiteral("file") &&
+            existingEntry.sha256 ==
+                previousDigest->sha256)
+        {
+            continue;
+        }
+        const QString caseCollision =
+            stagedPathsByKey.value(pathKey);
+        if (!caseCollision.isEmpty() &&
+            caseCollision.compare(
+                relativePath,
+                Qt::CaseSensitive) != 0)
+        {
+            appendFileOutcome(
+                report,
+                relativePath,
+                caseCollision,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-entry-case-collision"),
+                QString::fromUtf8(
+                    "旧输出目录项与本次暂存路径仅大小写不同"),
+                false,
+                entryType);
+            domainReportFor(report, domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        const QFileInfo stagedInformation(stagedPath);
+        if (stagedInformation.exists())
+        {
+            if (existingInformation.isDir() &&
+                stagedInformation.isDir() &&
+                !isFileSystemLink(
+                    stagedInformation))
+            {
+                appendFileOutcome(
+                    report,
+                    relativePath,
+                    relativePath,
+                    domain,
+                    AssetMigrationFileAction::Copy,
+                    QStringLiteral(
+                        "preserve-existing-directory-already-staged"),
+                    QString::fromUtf8(
+                        "旧输出目录已由本次暂存目录覆盖保留"),
+                    false,
+                    QStringLiteral("directory"));
+                preservedCount++;
+                continue;
+            }
+            if (existingInformation.isFile() &&
+                stagedInformation.isFile() &&
+                !isFileSystemLink(
+                    stagedInformation))
+            {
+                const auto stagedDigest =
+                    currentManagedOutputs.constFind(
+                        pathKey);
+                if (stagedDigest ==
+                        currentManagedOutputs.cend())
+                {
+                    appendFileOutcome(
+                        report,
+                        relativePath,
+                        relativePath,
+                        domain,
+                        AssetMigrationFileAction::Fail,
+                        QStringLiteral(
+                            "existing-managed-output-hash-failed"),
+                        QString::fromUtf8(
+                            "无法核对旧输出与新候选的 SHA-256，"
+                            "为避免覆盖玩家内容而取消发布"),
+                        false,
+                        entryType);
+                    domainReportFor(
+                        report,
+                        domain).failedFiles++;
+                    report.errorCount++;
+                    merged = false;
+                    continue;
+                }
+
+                if (existingEntry.sha256 ==
+                    stagedDigest->sha256)
+                {
+                    continue;
+                }
+
+                const auto previousDigest =
+                    previousManagedOutputs.constFind(
+                        pathKey);
+                if (previousDigest !=
+                        previousManagedOutputs.cend() &&
+                    existingEntry.sha256 ==
+                        previousDigest->sha256)
+                {
+                    // The previous managed bytes are intact. The new
+                    // generation may replace them transactionally.
+                    continue;
+                }
+
+                const bool provenanceMissing =
+                    previousDigest ==
+                    previousManagedOutputs.cend();
+                const QString reason =
+                    provenanceMissing
+                    ? QStringLiteral(
+                          "existing-managed-output-provenance-missing")
+                    : QStringLiteral(
+                          "existing-managed-output-modified");
+                const QString message =
+                    provenanceMissing
+                    ? QString::fromUtf8(
+                          "旧输出与新候选同路径且字节不同，"
+                          "上一代未记录可信 SHA-256；"
+                          "视为玩家内容冲突并取消发布")
+                    : QString::fromUtf8(
+                          "旧输出 SHA-256 与上一代记录不一致；"
+                          "视为玩家修改冲突并取消发布");
+                appendFileOutcome(
+                    report,
+                    relativePath,
+                    relativePath,
+                    domain,
+                    AssetMigrationFileAction::Fail,
+                    reason,
+                    message,
+                    false,
+                    entryType,
+                    existingEntry.sha256);
+                domainReportFor(
+                    report,
+                    domain).failedFiles++;
+                report.errorCount++;
+                merged = false;
+                continue;
+            }
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                existingInformation.isDir()
+                    ? QStringLiteral(
+                          "existing-directory-conflicts-with-staged-entry")
+                    : QStringLiteral(
+                          "existing-file-conflicts-with-staged-entry"),
+                existingInformation.isDir()
+                    ? QString::fromUtf8(
+                          "旧输出目录与本次暂存目录项冲突")
+                    : QString::fromUtf8(
+                          "旧输出文件与本次暂存目录项冲突"),
+                false,
+                entryType);
+            domainReportFor(report, domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        if (existingEntry.entryType ==
+            QStringLiteral("directory"))
+        {
+            if (!QDir().mkpath(stagedPath))
+            {
+                appendFileOutcome(
+                    report,
+                    relativePath,
+                    relativePath,
+                    domain,
+                    AssetMigrationFileAction::Fail,
+                    QStringLiteral(
+                        "preserve-existing-directory-failed"),
+                    QString::fromUtf8(
+                        "无法在本次暂存目录中保留旧输出目录"),
+                    false,
+                    QStringLiteral("directory"));
+                domainReportFor(report, domain).failedFiles++;
+                report.errorCount++;
+                merged = false;
+                continue;
+            }
+
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Copy,
+                QStringLiteral(
+                    "preserve-existing-player-directory"),
+                QString::fromUtf8(
+                    "本次转换未拥有该目录，保留旧输出目录项"),
+                false,
+                QStringLiteral("directory"));
+            stagedPathsByKey.insert(
+                pathKey,
+                relativePath);
+            preservedCount++;
+            continue;
+        }
+
+        if (existingEntry.entryType !=
+                QStringLiteral("file") ||
+            !ensureParentDirectory(stagedPath) ||
+            !QFile::copy(existingPath, stagedPath))
+        {
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "preserve-existing-output-failed"),
+                QString::fromUtf8(
+                    "无法把旧输出中的玩家文件复制到本次暂存目录"),
+                false,
+                entryType);
+            domainReportFor(report, domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        QString stagedSha256;
+        QString existingSha256AfterCopy;
+        if (!calculateFileSha256(
+                stagedPath,
+                stagedSha256) ||
+            !calculateFileSha256(
+                existingPath,
+                existingSha256AfterCopy) ||
+            stagedSha256 !=
+                existingEntry.sha256 ||
+            existingSha256AfterCopy !=
+                existingEntry.sha256)
+        {
+            appendFileOutcome(
+                report,
+                relativePath,
+                relativePath,
+                domain,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "preserve-existing-output-hash-failed"),
+                QString::fromUtf8(
+                    "旧玩家文件复制前后或暂存 SHA-256 不一致，取消发布"),
+                false,
+                entryType);
+            domainReportFor(report, domain).failedFiles++;
+            report.errorCount++;
+            merged = false;
+            continue;
+        }
+
+        appendFileOutcome(
+            report,
+            relativePath,
+            relativePath,
+            domain,
+            AssetMigrationFileAction::Copy,
+            QStringLiteral(
+                "preserve-existing-player-file"),
+            QString::fromUtf8(
+                "本次转换未拥有该路径，按原字节保留旧输出"),
+            false,
+            entryType,
+            stagedSha256);
+        stagedPathsByKey.insert(pathKey, relativePath);
+        report.writtenFiles++;
+        domainReportFor(report, domain).writtenFiles++;
+        preservedCount++;
+    }
+
+    if (preservedCount > 0)
+    {
+        const QString message = QString::fromUtf8(
+                "从旧输出保留 %1 个本次转换未拥有的玩家目录项。")
+                .arg(preservedCount);
+        report.logLines.append(message);
+        if (logCallback)
+            logCallback(message);
+    }
+    if (!merged)
+    {
+        const QString message = QString::fromUtf8(
+            "错误: 旧输出合并存在路径冲突或复制失败，取消发布。");
+        report.logLines.append(message);
+        if (logCallback)
+            logCallback(message);
+    }
+    return merged;
+}
+
+bool quarantineUnavailableScript(
+    const QString& stagingRoot,
+    const QString& existingOutputRoot,
+    const QMap<QString, bool>&
+        scannedSourcePathIsDirectory,
+    const ManagedOutputDigestMap&
+        previousManagedOutputs,
+    const QString& scriptPath,
+    QString& sourceRelativePath,
+    QString& quarantineRelativePath)
+{
+    sourceRelativePath = normalizedRelativePath(
+        QDir(stagingRoot).relativeFilePath(scriptPath));
+    if (sourceRelativePath.isEmpty() ||
+        sourceRelativePath == QStringLiteral("..") ||
+        sourceRelativePath.startsWith(
+            QStringLiteral("../")))
+    {
+        return false;
+    }
+
+    QMap<QString, bool> occupiedPathIsDirectory =
+        scannedSourcePathIsDirectory;
+    QSet<QString>
+        sourceOrStagingOccupiedPathKeys;
+    for (auto occupied =
+             scannedSourcePathIsDirectory.cbegin();
+         occupied !=
+             scannedSourcePathIsDirectory.cend();
+         ++occupied)
+    {
+        sourceOrStagingOccupiedPathKeys.insert(
+            occupied.key());
+    }
+    QSet<QString>
+        reusableExistingManagedPathKeys;
+    const auto collectOccupiedPaths =
+        [&](const QString& rootPath,
+            bool existingOutput)
+    {
+        const QDir rootDirectory(rootPath);
+        if (!rootDirectory.exists())
+            return;
+        QDirIterator iterator(
+            rootPath,
+            QDir::AllEntries |
+                QDir::NoDotAndDotDot |
+                QDir::Hidden |
+                QDir::System,
+            QDirIterator::Subdirectories);
+        while (iterator.hasNext())
+        {
+            const QString path =
+                iterator.next();
+            const QFileInfo information =
+                iterator.fileInfo();
+            const QString relativePath =
+                normalizedRelativePath(
+                    rootDirectory.
+                        relativeFilePath(path));
+            const QString pathKey =
+                lowerPathKey(relativePath);
+            const bool ordinaryDirectory =
+                information.isDir() &&
+                !isFileSystemLink(
+                    information);
+            if (!existingOutput)
+            {
+                sourceOrStagingOccupiedPathKeys.
+                    insert(pathKey);
+            }
+            else if (information.isFile() &&
+                     !isFileSystemLink(
+                         information))
+            {
+                const auto previous =
+                    previousManagedOutputs.
+                        constFind(pathKey);
+                QString actualSha256;
+                if (previous !=
+                        previousManagedOutputs.
+                            cend() &&
+                    calculateFileSha256(
+                        path,
+                        actualSha256) &&
+                    actualSha256 ==
+                        previous->sha256)
+                {
+                    reusableExistingManagedPathKeys.
+                        insert(pathKey);
+                }
+            }
+            const auto occupied =
+                occupiedPathIsDirectory.
+                    constFind(pathKey);
+            occupiedPathIsDirectory.insert(
+                pathKey,
+                occupied ==
+                        occupiedPathIsDirectory.
+                            cend()
+                    ? ordinaryDirectory
+                    : occupied.value() &&
+                          ordinaryDirectory);
+        }
+    };
+    collectOccupiedPaths(
+        stagingRoot,
+        false);
+    collectOccupiedPaths(
+        existingOutputRoot,
+        true);
+
+    const auto candidateIsAvailable =
+        [&](const QString& relativePath)
+    {
+        const QString candidateKey =
+            lowerPathKey(relativePath);
+        if (!isSafeManagedOutputRelativePath(
+                relativePath))
+        {
+            return false;
+        }
+        if (occupiedPathIsDirectory.contains(
+                candidateKey) &&
+            (sourceOrStagingOccupiedPathKeys.
+                 contains(candidateKey) ||
+             !reusableExistingManagedPathKeys.
+                  contains(candidateKey)))
+        {
+            return false;
+        }
+        const QStringList parts =
+            normalizedRelativePath(
+                relativePath).
+                split(
+                    QLatin1Char('/'),
+                    Qt::SkipEmptyParts);
+        QString ancestor;
+        for (int index = 0;
+             index + 1 < parts.size();
+             ++index)
+        {
+            if (!ancestor.isEmpty())
+                ancestor += QLatin1Char('/');
+            ancestor += parts[index];
+            const auto occupied =
+                occupiedPathIsDirectory.
+                    constFind(
+                        lowerPathKey(
+                            ancestor));
+            if (occupied !=
+                    occupiedPathIsDirectory.
+                        cend() &&
+                !occupied.value())
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const QString sourceHash =
+        QString::fromLatin1(
+            QCryptographicHash::hash(
+                sourceRelativePath.
+                    normalized(
+                        QString::
+                            NormalizationForm_C).
+                    toUtf8(),
+                QCryptographicHash::Sha256).
+                toHex().
+                left(12));
+    const QString preferredRelativePath =
+        QStringLiteral(
+            ".jxqy_migration_unavailable/") +
+        sourceRelativePath +
+        QStringLiteral(".invalid");
+    QString candidateRelativePath =
+        preferredRelativePath;
+    if (!candidateIsAvailable(
+            candidateRelativePath))
+    {
+        candidateRelativePath =
+            preferredRelativePath +
+            QLatin1Char('.') +
+            sourceHash;
+    }
+    if (!candidateIsAvailable(
+            candidateRelativePath))
+    {
+        const QString alternateRootBase =
+            QStringLiteral(
+                ".jxqy_migration_unavailable-") +
+            sourceHash;
+        quint64 suffix = 1;
+        do
+        {
+            const QString alternateRoot =
+                suffix == 1
+                ? alternateRootBase
+                : alternateRootBase +
+                      QLatin1Char('-') +
+                      QString::number(
+                          suffix);
+            candidateRelativePath =
+                alternateRoot +
+                QLatin1Char('/') +
+                sourceRelativePath +
+                QStringLiteral(".invalid");
+            ++suffix;
+        }
+        while (!candidateIsAvailable(
+            candidateRelativePath));
+    }
+
+    const QString candidatePath =
+        appendPath(
+            stagingRoot,
+            candidateRelativePath);
+    if (!ensureParentDirectory(candidatePath) ||
+        !QFile::rename(
+            scriptPath,
+            candidatePath))
+    {
+        return false;
+    }
+    quarantineRelativePath =
+        candidateRelativePath;
+    return true;
+}
+
+bool writeMigrationMarkerFile(
+    const QString& outputDir,
+    const ManagedOutputDigestMap&
+        managedOutputs =
+            ManagedOutputDigestMap())
+{
+    QString markerPath = appendPath(outputDir, kMigrationMarkerFileName);
+    ensureParentDirectory(markerPath);
+
+    QSaveFile file(markerPath);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+
+    QJsonObject hashes;
+    for (const ManagedOutputDigest& digest :
+         managedOutputs)
+    {
+        hashes.insert(
+            digest.relativePath,
+            digest.sha256);
+    }
+
+    QJsonObject root;
+    root.insert(
+        QStringLiteral("format"),
+        QStringLiteral(
+            "jxqy-editor-asset-migration-output"));
+    root.insert(
+        QStringLiteral("schemaVersion"),
+        MigrationMarkerSchemaVersion);
+    root.insert(
+        QStringLiteral("hashAlgorithm"),
+        QStringLiteral("sha256"));
+    root.insert(
+        QStringLiteral("managedOutputSha256"),
+        hashes);
+    const QByteArray payload =
+        QJsonDocument(root).toJson(
+            QJsonDocument::Indented);
+    if (file.write(payload) != payload.size())
+    {
+        file.cancelWriting();
+        return false;
+    }
+    return file.commit();
+}
+
+bool removePathIfExists(const QString& path)
+{
+    QFileInfo fileInfo(path);
+    if (!outputEntryExists(fileInfo))
+        return true;
+    if (isFileSystemLink(fileInfo))
+        return false;
+
+    if (fileInfo.isDir())
+    {
+        QDir dir(path);
+        return dir.removeRecursively();
+    }
+
+    return QFile::remove(path);
+}
+
+bool renamePath(const QString& sourcePath, const QString& targetPath,
+                JxAssetMigrator::FileSystemOperation operation)
+{
+    if (shouldFailFileSystemOperation(operation, sourcePath, targetPath))
+        return false;
+
+    QFileInfo sourceInfo(sourcePath);
+    if (!sourceInfo.exists() || QFileInfo::exists(targetPath) ||
+        !ensureParentDirectory(targetPath))
+    {
+        return false;
+    }
+
+    if (sourceInfo.isDir())
+        return QDir().rename(sourcePath, targetPath);
+    return QFile::rename(sourcePath, targetPath);
+}
+
+bool removeEmptyDirectoryIfExists(
+    const QString& path, JxAssetMigrator::FileSystemOperation operation)
+{
+    QDir directory(path);
+    if (!directory.exists())
+        return true;
+    if (shouldFailFileSystemOperation(operation, path))
+        return false;
+    if (!directory.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty())
+        return false;
+    return QDir().rmdir(path);
+}
+
+QString uniqueSiblingPath(const QString& path, const QString& label)
+{
+    return path + "." + label + "-" +
+        QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+bool publishStagedRoot(
+    const QString& stagingRoot,
+    const QString& outputRoot,
+    const ExistingOutputSnapshot&
+        expectedSnapshot,
+    QString& retainedBackupPath,
+    QString& errorMessage,
+    QString& changedRelativePath)
+{
+    const QFileInfo outputInformation(outputRoot);
+    const bool hadPreviousOutput =
+        outputEntryExists(outputInformation);
+    if (hadPreviousOutput !=
+            expectedSnapshot.rootExists ||
+        (hadPreviousOutput &&
+         (isFileSystemLink(outputInformation) ||
+          !outputInformation.isDir())))
+    {
+        changedRelativePath = QStringLiteral(".");
+        errorMessage = QString::fromUtf8(
+            "旧输出根在发布前发生变化，取消发布");
+        return false;
+    }
+
+    QString backupPath;
+    ExistingOutputSnapshot
+        validatedBackupSnapshot;
+    if (hadPreviousOutput)
+    {
+        backupPath = uniqueSiblingPath(outputRoot, "migration-backup");
+        if (!renamePath(outputRoot, backupPath,
+                        JxAssetMigrator::FileSystemOperation::BackupRoot))
+        {
+            errorMessage = QString::fromUtf8("无法备份上一份转换输出: %1").arg(outputRoot);
+            return false;
+        }
+
+        ExistingOutputSnapshot detachedSnapshot;
+        QString snapshotErrorPath;
+        QString snapshotError;
+        bool snapshotMatches =
+            collectExistingOutputSnapshot(
+                backupPath,
+                QStringList(),
+                detachedSnapshot,
+                snapshotErrorPath,
+                snapshotError);
+        if (snapshotMatches)
+        {
+            snapshotMatches =
+                compareExistingOutputSnapshots(
+                    expectedSnapshot,
+                    detachedSnapshot,
+                    true,
+                    changedRelativePath);
+        }
+        else
+        {
+            changedRelativePath =
+                snapshotErrorPath;
+        }
+        if (!snapshotMatches)
+        {
+            if (!renamePath(
+                    backupPath,
+                    outputRoot,
+                    JxAssetMigrator::
+                        FileSystemOperation::
+                            RestoreRoot))
+            {
+                retainedBackupPath =
+                    backupPath;
+                errorMessage =
+                    QString::fromUtf8(
+                        "旧输出在发布前发生变化，且恢复失败；"
+                        "完整备份仍位于 %1")
+                        .arg(backupPath);
+            }
+            else
+            {
+                errorMessage =
+                    QString::fromUtf8(
+                        "旧输出在发布前发生变化，"
+                        "已恢复旧输出并取消发布");
+            }
+            if (!snapshotError.isEmpty())
+                errorMessage +=
+                    QStringLiteral(": ") +
+                    snapshotError;
+            return false;
+        }
+        validatedBackupSnapshot =
+            detachedSnapshot;
+    }
+
+    if (!renamePath(stagingRoot, outputRoot,
+                    JxAssetMigrator::FileSystemOperation::PublishRoot))
+    {
+        if (hadPreviousOutput && !renamePath(
+                backupPath, outputRoot,
+                JxAssetMigrator::FileSystemOperation::RestoreRoot))
+        {
+            errorMessage = QString::fromUtf8(
+                "无法发布新转换输出，且上一份输出恢复失败；备份仍位于 %1")
+                .arg(backupPath);
+            retainedBackupPath = backupPath;
+        }
+        else
+        {
+            errorMessage = QString::fromUtf8("无法发布新转换输出，上一份输出已恢复: %1")
+                .arg(outputRoot);
+        }
+        return false;
+    }
+
+    if (hadPreviousOutput)
+    {
+        const bool cleanupBlocked =
+            shouldFailFileSystemOperation(
+                JxAssetMigrator::
+                    FileSystemOperation::
+                        RemoveBackup,
+                backupPath);
+        ExistingOutputSnapshot
+            cleanupSnapshot;
+        QString cleanupSnapshotPath;
+        QString cleanupSnapshotError;
+        const bool cleanupSnapshotRead =
+            collectExistingOutputSnapshot(
+                backupPath,
+                QStringList(),
+                cleanupSnapshot,
+                cleanupSnapshotPath,
+                cleanupSnapshotError);
+        QString changedBackupPath;
+        const bool backupUnchanged =
+            cleanupSnapshotRead &&
+            compareExistingOutputSnapshots(
+                validatedBackupSnapshot,
+                cleanupSnapshot,
+                true,
+                changedBackupPath);
+        const bool backupRootIsLink =
+            isFileSystemLink(
+                QFileInfo(backupPath));
+        if (backupRootIsLink)
+        {
+            retainedBackupPath = backupPath;
+            errorMessage = QString::fromUtf8(
+                "发布后旧输出备份根成为文件系统链接或 reparse point，"
+                "拒绝递归删除并保留该路径");
+        }
+        else if (!backupUnchanged)
+        {
+            retainedBackupPath = backupPath;
+            errorMessage = QString::fromUtf8(
+                "发布后旧输出备份发生变化，"
+                "为保留新写入内容未删除备份: %1")
+                .arg(
+                    changedBackupPath.isEmpty()
+                        ? cleanupSnapshotPath
+                        : changedBackupPath);
+        }
+        else if (cleanupBlocked ||
+                 !removePathIfExists(
+                     backupPath))
+        {
+            retainedBackupPath = backupPath;
+            errorMessage = QString::fromUtf8(
+                "旧输出备份清理失败");
+        }
+    }
+    return true;
+}
+
+struct PublishedEntry
+{
+    QString relativePath;
+    bool previousMoved = false;
+    bool stagedMoved = false;
+};
+
+bool publishStagedEntries(
+    const QString& stagingRoot,
+    const QString& outputRoot,
+    const QStringList& relativePaths,
+    const ExistingOutputSnapshot&
+        expectedSnapshot,
+    QString& retainedBackupPath,
+    QString& errorMessage,
+    QString& changedRelativePath)
+{
+    const QFileInfo outputInformation(outputRoot);
+    const bool hadOutputRoot =
+        outputEntryExists(outputInformation);
+    if (hadOutputRoot !=
+            expectedSnapshot.rootExists ||
+        (hadOutputRoot &&
+         (isFileSystemLink(outputInformation) ||
+          !outputInformation.isDir())))
+    {
+        changedRelativePath = QStringLiteral(".");
+        errorMessage = QString::fromUtf8(
+            "旧输出根在局部发布前发生变化，取消发布");
+        return false;
+    }
+    if (!QDir().mkpath(outputRoot))
+    {
+        errorMessage = QString::fromUtf8("无法创建转换输出目录: %1").arg(outputRoot);
+        return false;
+    }
+
+    const QString backupRoot = uniqueSiblingPath(outputRoot, "migration-backup");
+    QList<PublishedEntry> publishedEntries;
+    bool publishOk = true;
+    ExistingOutputSnapshot
+        validatedBackupSnapshot;
+
+    // Phase one detaches every selected old entry before any staging entry is
+    // made visible. This keeps a later validation or publish failure capable
+    // of restoring the complete previous selected generation.
+    for (const QString& relativePath : relativePaths)
+    {
+        PublishedEntry entry;
+        entry.relativePath = relativePath;
+        const QString finalPath = appendPath(outputRoot, relativePath);
+        const QString backupPath = appendPath(backupRoot, relativePath);
+
+        const QFileInfo finalInformation(finalPath);
+        if (outputEntryExists(finalInformation))
+        {
+            if (!renamePath(finalPath, backupPath,
+                            JxAssetMigrator::FileSystemOperation::BackupEntry))
+            {
+                errorMessage = QString::fromUtf8("无法备份现有转换子路径: %1").arg(finalPath);
+                publishOk = false;
+                publishedEntries.append(entry);
+                break;
+            }
+            entry.previousMoved = true;
+        }
+        publishedEntries.append(entry);
+    }
+
+    if (publishOk)
+    {
+        ExistingOutputSnapshot detachedSnapshot;
+        QString snapshotErrorPath;
+        QString snapshotError;
+        bool snapshotMatches =
+            collectExistingOutputSnapshot(
+                backupRoot,
+                relativePaths,
+                detachedSnapshot,
+                snapshotErrorPath,
+                snapshotError);
+        if (snapshotMatches)
+        {
+            snapshotMatches =
+                compareExistingOutputSnapshots(
+                    expectedSnapshot,
+                    detachedSnapshot,
+                    false,
+                    changedRelativePath);
+        }
+        else
+        {
+            changedRelativePath =
+                snapshotErrorPath;
+        }
+        if (!snapshotMatches)
+        {
+            publishOk = false;
+            errorMessage = QString::fromUtf8(
+                "旧输出在局部发布前发生变化，取消发布");
+            if (!snapshotError.isEmpty())
+                errorMessage +=
+                    QStringLiteral(": ") +
+                    snapshotError;
+        }
+        else
+        {
+            // backupRoot only contains entries detached from relativePaths.
+            // Reuse the snapshot that was already compared with the merge
+            // baseline so a write between two scans cannot become the cleanup
+            // baseline and then be deleted silently.
+            validatedBackupSnapshot =
+                detachedSnapshot;
+        }
+    }
+
+    // Phase two starts only after the complete detached backup matches the
+    // merge snapshot.
+    if (publishOk)
+    {
+        for (PublishedEntry& entry :
+             publishedEntries)
+        {
+            const QString finalPath =
+                appendPath(
+                    outputRoot,
+                    entry.relativePath);
+            const QString stagedPath =
+                appendPath(
+                    stagingRoot,
+                    entry.relativePath);
+            if (!QFileInfo::exists(stagedPath))
+                continue;
+            if (!renamePath(stagedPath, finalPath,
+                            JxAssetMigrator::FileSystemOperation::PublishEntry))
+            {
+                errorMessage = QString::fromUtf8("无法发布转换子路径: %1").arg(finalPath);
+                publishOk = false;
+                break;
+            }
+            entry.stagedMoved = true;
+        }
+    }
+
+    if (!publishOk)
+    {
+        bool rollbackOk = true;
+        for (auto entry = publishedEntries.crbegin(); entry != publishedEntries.crend(); ++entry)
+        {
+            const QString finalPath = appendPath(outputRoot, entry->relativePath);
+            const QString backupPath = appendPath(backupRoot, entry->relativePath);
+            if (entry->stagedMoved && !renamePath(
+                    finalPath, appendPath(stagingRoot, entry->relativePath),
+                    JxAssetMigrator::FileSystemOperation::RollbackPublishedEntry))
+            {
+                rollbackOk = false;
+            }
+            if (entry->previousMoved && !renamePath(
+                    backupPath, finalPath,
+                    JxAssetMigrator::FileSystemOperation::RestoreEntry))
+                rollbackOk = false;
+        }
+        if (rollbackOk && !hadOutputRoot &&
+            !removeEmptyDirectoryIfExists(
+                outputRoot,
+                JxAssetMigrator::FileSystemOperation::RemoveCreatedOutputRoot))
+        {
+            rollbackOk = false;
+            errorMessage += QString::fromUtf8("；回滚未能移除本次新建的输出目录: %1")
+                .arg(outputRoot);
+        }
+        if (!rollbackOk)
+        {
+            retainedBackupPath = backupRoot;
+            errorMessage += QString::fromUtf8("；回滚未完全成功，备份保留在 %1").arg(backupRoot);
+        }
+        else
+        {
+            if (shouldFailFileSystemOperation(
+                    JxAssetMigrator::FileSystemOperation::RemoveBackup, backupRoot) ||
+                !removePathIfExists(backupRoot))
+            {
+                retainedBackupPath = backupRoot;
+                errorMessage += QString::fromUtf8("；回滚备份目录清理失败: %1")
+                    .arg(backupRoot);
+            }
+        }
+        return false;
+    }
+
+    removePathIfExists(stagingRoot);
+    if (outputEntryExists(
+            QFileInfo(backupRoot)))
+    {
+        const bool cleanupBlocked =
+            shouldFailFileSystemOperation(
+                JxAssetMigrator::
+                    FileSystemOperation::
+                        RemoveBackup,
+                backupRoot);
+        ExistingOutputSnapshot
+            cleanupSnapshot;
+        QString cleanupSnapshotPath;
+        QString cleanupSnapshotError;
+        const bool cleanupSnapshotRead =
+            collectExistingOutputSnapshot(
+                backupRoot,
+                QStringList(),
+                cleanupSnapshot,
+                cleanupSnapshotPath,
+                cleanupSnapshotError);
+        QString changedBackupPath;
+        const bool backupUnchanged =
+            cleanupSnapshotRead &&
+            compareExistingOutputSnapshots(
+                validatedBackupSnapshot,
+                cleanupSnapshot,
+                true,
+                changedBackupPath);
+        const bool backupRootIsLink =
+            isFileSystemLink(
+                QFileInfo(backupRoot));
+        if (backupRootIsLink)
+        {
+            retainedBackupPath =
+                backupRoot;
+            errorMessage = QString::fromUtf8(
+                "发布后旧输出备份根成为文件系统链接或 reparse point，"
+                "拒绝递归删除并保留该路径");
+        }
+        else if (!backupUnchanged)
+        {
+            retainedBackupPath =
+                backupRoot;
+            errorMessage = QString::fromUtf8(
+                "发布后旧输出备份发生变化，"
+                "为保留新写入内容未删除备份: %1")
+                .arg(
+                    changedBackupPath.isEmpty()
+                        ? cleanupSnapshotPath
+                        : changedBackupPath);
+        }
+        else if (cleanupBlocked ||
+                 !removePathIfExists(
+                     backupRoot))
+        {
+            retainedBackupPath =
+                backupRoot;
+            errorMessage = QString::fromUtf8(
+                "旧输出备份清理失败");
+        }
+    }
+    return true;
+}
+
+QString normalizeIncludePrefix(QString prefix)
+{
+    prefix.replace("\\", "/");
+    prefix = prefix.trimmed();
+    while (prefix.startsWith('/'))
+        prefix.remove(0, 1);
+    while (prefix.endsWith('/'))
+        prefix.chop(1);
+    return prefix;
+}
+
+bool isSafeRelativeSubdirectory(const QString& path)
+{
+    const QString normalized = normalizeIncludePrefix(path);
+    if (normalized.isEmpty() || QDir::isAbsolutePath(path))
+        return false;
+
+    const QStringList parts = normalized.split('/', Qt::KeepEmptyParts);
+    for (const QString& part : parts)
+    {
+        if (part.isEmpty() || part == "." || part == ".." || part.contains(':') ||
+            part.contains(QChar::Null))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool containsIniLineBreak(const QString& value)
+{
+    return value.contains('\r') || value.contains('\n') || value.contains(QChar::Null);
+}
+
+bool hasUnsafeProfileText(const AssetMigrationOptions& options)
+{
+    const QStringList values = {
+        options.modId,
+        options.modName,
+        options.dependencyId,
+        options.uiBaseId,
+        options.uiProfile,
+        options.saveNamespace
+    };
+    for (const QString& value : values)
+    {
+        if (containsIniLineBreak(value))
+            return true;
+    }
+    for (auto feature = options.features.cbegin(); feature != options.features.cend(); ++feature)
+    {
+        if (containsIniLineBreak(feature.key()))
+            return true;
+    }
+    return false;
+}
+
+QString matchedCasePreservingPrefix(const QString& relativePath, const QString& includePrefix)
+{
+    QString normalizedPath = relativePath;
+    normalizedPath.replace("\\", "/");
+    const QStringList pathParts = normalizedPath.split('/', Qt::SkipEmptyParts);
+    const QStringList prefixParts = normalizeIncludePrefix(includePrefix).split('/', Qt::SkipEmptyParts);
+    if (prefixParts.isEmpty() || prefixParts.size() > pathParts.size())
+        return QString();
+
+    for (qsizetype i = 0; i < prefixParts.size(); ++i)
+    {
+        if (pathParts[i].compare(prefixParts[i], fileSystemPathCaseSensitivity()) != 0)
+            return QString();
+    }
+    return pathParts.mid(0, prefixParts.size()).join('/');
+}
+
+bool relativePathMatchesPrefix(const QString& relativePath, const QString& includePrefix)
+{
+    QString prefix = normalizeIncludePrefix(includePrefix);
+    if (prefix.isEmpty())
+        return true;
+
+    QString path = relativePath;
+    path.replace("\\", "/");
+    const Qt::CaseSensitivity caseSensitivity = fileSystemPathCaseSensitivity();
+    return path.compare(prefix, caseSensitivity) == 0 ||
+        path.startsWith(prefix + "/", caseSensitivity);
+}
+
+enum class UiWindowDefaultProfile
+{
+    Jxqy2,
+    Yycs,
+    Xjxqy
+};
+
+QString firstDependencyId(const QString& dependencyIds)
+{
+    const QStringList parts = dependencyIds.split(',', Qt::SkipEmptyParts);
+    for (const QString& part : parts)
+    {
+        const QString dependencyId = part.trimmed();
+        if (!dependencyId.isEmpty())
+            return dependencyId;
+    }
+    return QString();
+}
+
+QStringList dependencyIds(const QString& declaredIds)
+{
+    QStringList result;
+    for (const QString& part :
+         declaredIds.split(',', Qt::SkipEmptyParts))
+    {
+        const QString dependencyId = part.trimmed();
+        if (!dependencyId.isEmpty() &&
+            !result.contains(dependencyId, Qt::CaseInsensitive))
+        {
+            result.append(dependencyId);
+        }
+    }
+    return result;
+}
+
+bool findDependencyPack(
+    const QString& outputDir,
+    const AssetMigrationOptions& options,
+    const QStringList& requestedIds,
+    ResourcePackInfo& result)
+{
+    const QString normalizedOutputRoot =
+        QDir::cleanPath(QFileInfo(outputDir).absoluteFilePath());
+    QString candidateCollectionRoot =
+        QFileInfo(normalizedOutputRoot).absolutePath();
+    for (int depth = 0;
+         depth < 16 && !candidateCollectionRoot.isEmpty();
+         ++depth)
+    {
+        const QDir candidateDirectory(candidateCollectionRoot);
+        if (QFileInfo::exists(candidateDirectory.filePath(
+                QStringLiteral("resources.ini"))) ||
+            ResourcePackScanner::hasManifest(candidateCollectionRoot))
+        {
+            const QList<ResourcePackInfo> packs =
+                ResourcePackScanner::scanPacks(candidateCollectionRoot);
+            for (const QString& dependencyId : requestedIds)
+            {
+                for (const ResourcePackInfo& pack : packs)
+                {
+                    if (pack.profile.id.compare(
+                            dependencyId,
+                            Qt::CaseInsensitive) == 0)
+                    {
+                        result = pack;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        const QString parentRoot =
+            QFileInfo(candidateCollectionRoot).absolutePath();
+        if (parentRoot == candidateCollectionRoot)
+        {
+            break;
+        }
+        candidateCollectionRoot = parentRoot;
+    }
+
+    return false;
+}
+
+bool findDependencyProfile(
+    const QString& outputDir,
+    const AssetMigrationOptions& options,
+    GameProfile& profile)
+{
+    ResourcePackInfo dependencyPack;
+    if (!findDependencyPack(
+            outputDir,
+            options,
+            dependencyIds(options.dependencyId),
+            dependencyPack))
+    {
+        return false;
+    }
+    profile = dependencyPack.profile;
+    return true;
+}
+
+QString findUiBaseRoot(
+    const QString& outputDir,
+    const AssetMigrationOptions& options,
+    GameProfile* selectedProfile)
+{
+    if (selectedProfile)
+        *selectedProfile = GameProfile();
+    QStringList requestedIds;
+    const QString uiBaseId = options.uiBaseId.trimmed();
+    if (!uiBaseId.isEmpty())
+        requestedIds.append(uiBaseId);
+
+    const QString uiProfile = options.uiProfile.trimmed();
+    const QStringList declaredDependencyIds =
+        dependencyIds(options.dependencyId);
+    if (uiBaseId.isEmpty())
+    {
+        for (const QString& dependencyId : declaredDependencyIds)
+        {
+            if (!uiProfile.isEmpty() &&
+                dependencyId.compare(uiProfile, Qt::CaseInsensitive) == 0 &&
+                !requestedIds.contains(dependencyId, Qt::CaseInsensitive))
+            {
+                requestedIds.append(dependencyId);
+            }
+        }
+        for (const QString& dependencyId : declaredDependencyIds)
+        {
+            if (!requestedIds.contains(dependencyId, Qt::CaseInsensitive))
+                requestedIds.append(dependencyId);
+        }
+    }
+
+    for (const QString& requestedId : requestedIds)
+    {
+        ResourcePackInfo uiBasePack;
+        if (!findDependencyPack(
+                outputDir,
+                options,
+                QStringList{requestedId},
+                uiBasePack))
+        {
+            continue;
+        }
+        if (uiBasePack.profile.id.compare(
+                requestedId, Qt::CaseInsensitive) != 0)
+        {
+            continue;
+        }
+        if (uiBaseId.isEmpty() && !uiProfile.isEmpty() &&
+            uiBasePack.profile.id.compare(
+                uiProfile, Qt::CaseInsensitive) != 0 &&
+            uiBasePack.profile.uiProfile.compare(
+                uiProfile, Qt::CaseInsensitive) != 0)
+        {
+            continue;
+        }
+
+        const QString normalizedOutputRoot =
+            QDir::cleanPath(QFileInfo(outputDir).absoluteFilePath());
+        const QString normalizedBaseRoot =
+            QDir::cleanPath(QFileInfo(uiBasePack.rootPath).absoluteFilePath());
+        if (normalizedBaseRoot.compare(
+                normalizedOutputRoot,
+                fileSystemPathCaseSensitivity()) != 0)
+        {
+            if (selectedProfile)
+                *selectedProfile = uiBasePack.profile;
+            return normalizedBaseRoot;
+        }
+    }
+    return QString();
+}
+
+void setFeatureDefault(
+    QMap<QString, bool>& features,
+    const QString& name,
+    bool value)
+{
+    for (auto feature = features.cbegin(); feature != features.cend(); ++feature)
+    {
+        if (feature.key().compare(name, Qt::CaseInsensitive) == 0)
+        {
+            return;
+        }
+    }
+    features.insert(name, value);
+}
+
+void applyExplicitProfileValues(
+    const GameProfile& profile,
+    bool titleMusicIsExplicit,
+    AssetMigrationOptions& options)
+{
+    if (!options.attackReleaseFrameRatioDefined && profile.attackReleaseFrameRatioDefined)
+    {
+        options.attackReleaseFrameRatio = profile.attackReleaseFrameRatio;
+        options.attackReleaseFrameRatioDefined = true;
+    }
+    if (!options.specialAttackReleaseFrameRatioDefined && profile.specialAttackReleaseFrameRatioDefined)
+    {
+        options.specialAttackReleaseFrameRatio = profile.specialAttackReleaseFrameRatio;
+        options.specialAttackReleaseFrameRatioDefined = true;
+    }
+    if (!options.magicReleaseFrameRatioDefined && profile.magicReleaseFrameRatioDefined)
+    {
+        options.magicReleaseFrameRatio = profile.magicReleaseFrameRatio;
+        options.magicReleaseFrameRatioDefined = true;
+    }
+    if (!options.defeatedNpcExperienceModeDefined &&
+        profile.defeatedNpcExperienceModeDefined)
+    {
+        options.defeatedNpcExperienceMode =
+            profile.defeatedNpcExperienceMode;
+        options.defeatedNpcExperienceModeDefined = true;
+    }
+    if (!options.levelUpThresholdModeDefined &&
+        profile.levelUpThresholdModeDefined)
+    {
+        options.levelUpThresholdMode = profile.levelUpThresholdMode;
+        options.levelUpThresholdModeDefined = true;
+    }
+    if (!options.partnerFollowRadiusDefined &&
+        profile.partnerFollowRadiusDefined)
+    {
+        options.partnerFollowRadius = profile.partnerFollowRadius;
+        options.partnerFollowRadiusDefined = true;
+    }
+    if (!options.partnerFollowRunRadiusDefined &&
+        profile.partnerFollowRunRadiusDefined)
+    {
+        options.partnerFollowRunRadius = profile.partnerFollowRunRadius;
+        options.partnerFollowRunRadiusDefined = true;
+    }
+    if (!options.minimumMagicDamageDefined &&
+        profile.minimumMagicDamageDefined)
+    {
+        options.minimumMagicDamage = profile.minimumMagicDamage;
+        options.minimumMagicDamageDefined = true;
+    }
+    if (!options.magicEffectCalculationModeDefined &&
+        profile.magicEffectCalculationModeDefined)
+    {
+        options.magicEffectCalculationMode =
+            profile.magicEffectCalculationMode;
+        options.magicEffectCalculationModeDefined = true;
+    }
+    if (!options.npcActionProfileDefined &&
+        profile.npcActionProfileDefined)
+    {
+        options.npcActionProfile = profile.npcActionProfile;
+        options.npcActionProfileDefined = true;
+    }
+    if (!options.npcRuntimeProfileDefined &&
+        profile.npcRuntimeProfileDefined)
+    {
+        options.npcRuntimeProfile = profile.npcRuntimeProfile;
+        options.npcRuntimeProfileDefined = true;
+    }
+    if (!options.specialActionModeDefined &&
+        profile.specialActionModeDefined)
+    {
+        options.specialActionMode = profile.specialActionMode;
+        options.specialActionModeDefined = true;
+    }
+    if (!options.addLifeModeDefined && profile.addLifeModeDefined)
+    {
+        options.addLifeMode = profile.addLifeMode;
+        options.addLifeModeDefined = true;
+    }
+    if (!options.titleMusicDefined && titleMusicIsExplicit)
+    {
+        options.titleMusic = profile.titleMusic;
+        options.titleMusicDefined = true;
+    }
+    if (options.features.isEmpty())
+    {
+        options.features = profile.features;
+    }
+}
+
+void applyProfileDefaults(
+    const GameProfile& profile,
+    AssetMigrationOptions& options)
+{
+    const int fallbackType = profile.typeDefined
+        ? profile.type
+        : options.modType;
+    const bool trilogy = fallbackType == 1 || fallbackType == 2;
+
+    if (!options.defeatedNpcExperienceModeDefined)
+    {
+        options.defeatedNpcExperienceMode =
+            profile.defeatedNpcExperienceModeDefined
+            ? profile.defeatedNpcExperienceMode
+            : (fallbackType == 0
+                ? DefeatedNpcExperienceMode::StoredExperience
+                : DefeatedNpcExperienceMode::LevelProductWithBonus);
+        options.defeatedNpcExperienceModeDefined = true;
+    }
+    if (!options.levelUpThresholdModeDefined)
+    {
+        options.levelUpThresholdMode = profile.levelUpThresholdModeDefined
+            ? profile.levelUpThresholdMode
+            : (trilogy
+                ? LevelUpThresholdMode::GreaterThan
+                : LevelUpThresholdMode::GreaterThanOrEqual);
+        options.levelUpThresholdModeDefined = true;
+    }
+    if (!options.partnerFollowRadiusDefined)
+    {
+        options.partnerFollowRadius = profile.partnerFollowRadiusDefined
+            ? profile.partnerFollowRadius
+            : (trilogy ? 2 : 1);
+        options.partnerFollowRadiusDefined = true;
+    }
+    if (!options.partnerFollowRunRadiusDefined)
+    {
+        options.partnerFollowRunRadius = profile.partnerFollowRunRadiusDefined
+            ? profile.partnerFollowRunRadius
+            : 5;
+        options.partnerFollowRunRadiusDefined = true;
+    }
+    if (!options.minimumMagicDamageDefined &&
+        profile.minimumMagicDamageDefined)
+    {
+        options.minimumMagicDamage = profile.minimumMagicDamage;
+        options.minimumMagicDamageDefined = true;
+    }
+    if (!options.magicEffectCalculationModeDefined)
+    {
+        options.magicEffectCalculationMode =
+            profile.magicEffectCalculationModeDefined
+                ? profile.magicEffectCalculationMode
+                : (fallbackType == 2
+                    ? MagicEffectCalculationMode::AddToAttack
+                    : MagicEffectCalculationMode::ReplaceAttack);
+        options.magicEffectCalculationModeDefined = true;
+    }
+    if (!options.npcActionProfileDefined)
+    {
+        options.npcActionProfile = profile.npcActionProfileDefined
+            ? profile.npcActionProfile
+            : (fallbackType == 1
+                ? ScriptNpcActionProfile::Yycs
+                : (fallbackType == 2
+                    ? ScriptNpcActionProfile::Xjxqy
+                    : ScriptNpcActionProfile::Legacy));
+        options.npcActionProfileDefined = true;
+    }
+    if (!options.npcRuntimeProfileDefined)
+    {
+        options.npcRuntimeProfile = profile.npcRuntimeProfileDefined
+            ? profile.npcRuntimeProfile
+            : (trilogy
+                ? ScriptNpcRuntimeProfile::Trilogy
+                : ScriptNpcRuntimeProfile::Legacy);
+        options.npcRuntimeProfileDefined = true;
+    }
+    if (!options.specialActionModeDefined)
+    {
+        options.specialActionMode = profile.specialActionModeDefined
+            ? profile.specialActionMode
+            : (trilogy
+                ? ScriptSpecialActionMode::Overlay
+                : ScriptSpecialActionMode::Replace);
+        options.specialActionModeDefined = true;
+    }
+    if (!options.addLifeModeDefined)
+    {
+        options.addLifeMode = profile.addLifeModeDefined
+            ? profile.addLifeMode
+            : (trilogy
+                ? ScriptAddLifeMode::DirectClamp
+                : ScriptAddLifeMode::PlayerRules);
+        options.addLifeModeDefined = true;
+    }
+    if (!options.titleMusicDefined)
+    {
+        options.titleMusic = profile.titleMusic;
+        options.titleMusicDefined = true;
+    }
+
+    for (auto feature = profile.features.cbegin();
+         feature != profile.features.cend(); ++feature)
+    {
+        setFeatureDefault(options.features, feature.key(), feature.value());
+    }
+    setFeatureDefault(
+        options.features,
+        QStringLiteral("LumAsBrightness"),
+        !trilogy);
+    setFeatureDefault(
+        options.features,
+        QStringLiteral("AmbientLumOverlay"),
+        !trilogy);
+    setFeatureDefault(
+        options.features,
+        QStringLiteral("RainSceneTint"),
+        trilogy);
+}
+
+void applyTypeFallbackDefaults(AssetMigrationOptions& options)
+{
+    int fallbackType = options.modType;
+    if (fallbackType < 0)
+    {
+        const QString dependencyId =
+            firstDependencyId(options.dependencyId).toUpper();
+        if (dependencyId == QStringLiteral("JXQY2"))
+        {
+            fallbackType = 0;
+        }
+        else if (dependencyId == QStringLiteral("YYCS"))
+        {
+            fallbackType = 1;
+        }
+        else if (dependencyId == QStringLiteral("XJXQY"))
+        {
+            fallbackType = 2;
+        }
+    }
+    GameProfile fallback;
+    fallback.type = fallbackType;
+    fallback.typeDefined = fallbackType >= 0;
+    if (fallbackType == 0)
+    {
+        fallback.titleMusic = QStringLiteral("ks64.mp3");
+    }
+    else if (fallbackType == 1)
+    {
+        fallback.titleMusic = QStringLiteral("mc000.mp3");
+    }
+    else if (fallbackType == 2)
+    {
+        fallback.titleMusic = QString::fromUtf8("情缘之伴奏.mp3");
+    }
+    applyProfileDefaults(fallback, options);
+}
+
+QString defaultTitleMusicForOptions(const AssetMigrationOptions& options)
+{
+    return options.titleMusicDefined
+        ? options.titleMusic
+        : QString();
+}
+
+UiWindowDefaultProfile uiWindowDefaultProfileForOptions(const AssetMigrationOptions& options)
+{
+    QString uiProfile = options.uiProfile.trimmed().toLower();
+    if (uiProfile == "jxqy2")
+        return UiWindowDefaultProfile::Jxqy2;
+    if (uiProfile == "xjxqy")
+        return UiWindowDefaultProfile::Xjxqy;
+    if (uiProfile == "yycs")
+        return UiWindowDefaultProfile::Yycs;
+
+    QString dependencyId = firstDependencyId(options.dependencyId).toUpper();
+    if (options.modType == 0)
+        return UiWindowDefaultProfile::Jxqy2;
+    if (options.modType == 1)
+        return UiWindowDefaultProfile::Yycs;
+    if (options.modType == 2)
+        return UiWindowDefaultProfile::Xjxqy;
+    if (dependencyId == "JXQY2")
+        return UiWindowDefaultProfile::Jxqy2;
+    if (dependencyId == "XJXQY")
+        return UiWindowDefaultProfile::Xjxqy;
+    return UiWindowDefaultProfile::Yycs;
+}
+
+QString uiWindowDefaultProfileName(UiWindowDefaultProfile profile)
+{
+    switch (profile)
+    {
+    case UiWindowDefaultProfile::Jxqy2:
+        return "jxqy2";
+    case UiWindowDefaultProfile::Xjxqy:
+        return "xjxqy";
+    case UiWindowDefaultProfile::Yycs:
+    default:
+        return "yycs";
+    }
+}
+
+UiWindowDefaultProfile detectUiWindowDefaultProfile(
+    const QString& sourceRoot,
+    const AssetMigrationOptions& options,
+    bool* authoritativeProfile = nullptr)
+{
+    if (authoritativeProfile != nullptr)
+        *authoritativeProfile = false;
+    if (!options.uiProfile.trimmed().isEmpty())
+    {
+        if (authoritativeProfile != nullptr)
+            *authoritativeProfile = true;
+        return uiWindowDefaultProfileForOptions(options);
+    }
+
+    const QSet<QString> relevantPaths = {
+        "asf/ui/dialog/panel.asf",
+        "asf/ui/dialog/window-dialog.asf",
+        "asf/ui/top/window.asf",
+        "ini/ui/top/window.ini",
+        "mpc/ui/dialog/panel.mpc"
+    };
+    QSet<QString> sourcePaths;
+    QDir source(sourceRoot);
+    QDirIterator iterator(sourceRoot, QDir::Files, QDirIterator::Subdirectories);
+    while (iterator.hasNext() && sourcePaths.size() < relevantPaths.size())
+    {
+        const QString relativePath = lowerPathKey(source.relativeFilePath(iterator.next()));
+        if (relevantPaths.contains(relativePath))
+            sourcePaths.insert(relativePath);
+    }
+
+    if (sourcePaths.contains("asf/ui/dialog/window-dialog.asf"))
+    {
+        if (authoritativeProfile != nullptr)
+            *authoritativeProfile = true;
+        return UiWindowDefaultProfile::Xjxqy;
+    }
+    if (sourcePaths.contains("mpc/ui/dialog/panel.mpc"))
+    {
+        if (authoritativeProfile != nullptr)
+            *authoritativeProfile = true;
+        return UiWindowDefaultProfile::Jxqy2;
+    }
+    if (sourcePaths.contains("asf/ui/dialog/panel.asf") &&
+        (sourcePaths.contains("asf/ui/top/window.asf") ||
+            sourcePaths.contains("ini/ui/top/window.ini")))
+    {
+        if (authoritativeProfile != nullptr)
+            *authoritativeProfile = true;
+        return UiWindowDefaultProfile::Yycs;
+    }
+    return uiWindowDefaultProfileForOptions(options);
+}
+
+bool isIgnoredLegacyNonRuntimeFile(const QString& filePath, const QString& relativePath)
+{
+    QFileInfo fileInfo(filePath);
+    if (fileInfo.fileName().compare(QStringLiteral("vssver.scc"), Qt::CaseInsensitive) == 0)
+        return true;
+
+    QString path = lowerPathKey(relativePath);
+    while (path.startsWith("./"))
+        path = path.mid(2);
+
+    QString extension = fileInfo.suffix().toLower();
+    if (isLegacyContentAudioPath(path))
+    {
+        return !fileInfo.isDir() && !isLegacyXnbSound(path) &&
+            extension != "wav" && extension != "mp3" && extension != "ogg" && extension != "wma";
+    }
+    if (extension == "exe" || extension == "dll" || extension == "pdb" || extension == "xnb")
+        return true;
+    if (extension == "zip" || extension == "rar" || extension == "7z")
+        return true;
+    if (path == "save" || path.startsWith("save/"))
+        return true;
+    if (path == "content" || path.startsWith("content/"))
+        return true;
+    if (fileInfo.fileName().startsWith(QStringLiteral("migration_report."), Qt::CaseInsensitive) ||
+        fileInfo.fileName().startsWith(QStringLiteral("conversion_report."), Qt::CaseInsensitive) ||
+        fileInfo.fileName().compare(QStringLiteral(".jxqy_asset_migration_marker"), Qt::CaseInsensitive) == 0)
+    {
+        return true;
+    }
+
+    // Unknown custom roots and root-level files are player content. Preserve
+    // them byte-for-byte instead of treating the runtime-root allowlist as a
+    // deletion policy.
+    return false;
+}
+
+bool mapLegacyNewGameSaveTemplatePath(const QString& relativePath, QString& mappedPath)
+{
+    mappedPath.clear();
+    QString normalized = relativePath;
+    normalized.replace("\\", "/");
+    while (normalized.startsWith("./"))
+        normalized = normalized.mid(2);
+
+    QString path = lowerPathKey(normalized);
+    const QString prefix = "save/rpg0/";
+    if (!path.startsWith(prefix))
+        return false;
+
+    QString tail = normalized.mid(prefix.size());
+    if (tail.isEmpty())
+        return false;
+    if (tail.compare(QStringLiteral("game.ini"), Qt::CaseInsensitive) == 0)
+        tail = "game.ini";
+
+    mappedPath = "ini/save/" + tail;
+    return true;
+}
+
+bool isIdentifierStart(QChar ch)
+{
+    ushort value = ch.unicode();
+    return ch == '_' ||
+        (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z');
+}
+
+bool isIdentifierChar(QChar ch)
+{
+    ushort value = ch.unicode();
+    return isIdentifierStart(ch) || (value >= '0' && value <= '9');
+}
+
+bool convertLegacyJxTextToUtf8(const std::string& content, const QString& sourceEncoding, std::string& utf8Content)
+{
+    LegacyTextEncoding encoding = LegacyTextEncoding::Auto;
+    return LegacyTextDecoder::parseEncoding(
+               sourceEncoding.toStdString(), encoding) &&
+        LegacyTextDecoder::decodeToUtf8(
+            content, encoding, utf8Content);
+}
+
+int findLineComment(const QString& line)
+{
+    bool inString = false;
+    bool escaped = false;
+    for (int i = 0; i + 1 < line.size(); i++)
+    {
+        QChar ch = line[i];
+        if (escaped)
+        {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\' && inString)
+        {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"')
+        {
+            inString = !inString;
+            continue;
+        }
+        if (!inString && ch == '/' && line[i + 1] == '/')
+            return i;
+        if (!inString && ch == '-' && line[i + 1] == '-')
+            return i;
+    }
+    return -1;
+}
+
+bool looksLikeResourceReference(const QString& value)
+{
+    static const QRegularExpression resourceReferencePattern(
+        QStringLiteral(
+            R"(^[^\s\"<>|?*]+\.(?:ini|txt|npc|obj|map|tmx|asf|mpc|mpi|img|imp|pic|shd|wav|mp3|wma|ogg|mid|xnb|avi|wmv|mp4|mkv|bmp|png|jpg|jpeg|gif|fnt|ttf|dat)(?:[?#].*)?$)"),
+        QRegularExpression::CaseInsensitiveOption);
+    return resourceReferencePattern.match(value.trimmed()).hasMatch();
+}
+
+bool looksLikeResourceReferenceList(const QString& value)
+{
+    const QStringList entries = value.split(',', Qt::SkipEmptyParts);
+    if (entries.isEmpty())
+        return false;
+    for (const QString& entry : entries)
+    {
+        if (!looksLikeResourceReference(entry))
+            return false;
+    }
+    return true;
+}
+
+bool isIniDisplayTextKey(const QString& key)
+{
+    if (key == QStringLiteral("filename") ||
+        key.endsWith(QStringLiteral("filename")))
+    {
+        return false;
+    }
+    return key == QStringLiteral("name") ||
+        key == QStringLiteral("intro") ||
+        key == QStringLiteral("description") ||
+        key == QStringLiteral("text") ||
+        key == QStringLiteral("format") ||
+        key == QStringLiteral("caption") ||
+        key == QStringLiteral("tip") ||
+        key == QStringLiteral("message") ||
+        key == QStringLiteral("author") ||
+        key == QStringLiteral("title");
+}
+
+QString lowercaseIniResourceReferences(const QString& text)
+{
+    QStringList lines = text.split('\n');
+    for (QString& line : lines)
+    {
+        const QString trimmed = line.trimmed();
+        if (trimmed.isEmpty() || trimmed.startsWith(';') ||
+            trimmed.startsWith('#') || trimmed.startsWith('['))
+        {
+            continue;
+        }
+
+        const int separator = line.indexOf('=');
+        if (separator <= 0)
+            continue;
+        const QString key = line.left(separator).trimmed().toLower();
+        const QString value = line.mid(separator + 1);
+        if (!isIniDisplayTextKey(key) &&
+            looksLikeResourceReferenceList(value))
+        {
+            line = line.left(separator + 1) +
+                lowercaseAsciiPath(value);
+        }
+    }
+    return lines.join('\n');
+}
+
+const QSet<QString>& allStringArgumentsAreResourceReferences()
+{
+    static const QSet<QString> functions = {
+        QStringLiteral("addgoods"),
+        QStringLiteral("addmagic"),
+        QStringLiteral("addmagicexp"),
+        QStringLiteral("addrandgoods"),
+        QStringLiteral("addtalent"),
+        QStringLiteral("buygoods"),
+        QStringLiteral("buygoodsonly"),
+        QStringLiteral("cleargoods"),
+        QStringLiteral("delgoods"),
+        QStringLiteral("delmagic"),
+        QStringLiteral("equipgoods"),
+        QStringLiteral("loadmap"),
+        QStringLiteral("loadnpc"),
+        QStringLiteral("loadobj"),
+        QStringLiteral("movemagic"),
+        QStringLiteral("playmovie"),
+        QStringLiteral("playmusic"),
+        QStringLiteral("playrandommusic"),
+        QStringLiteral("playsound"),
+        QStringLiteral("runscript"),
+        QStringLiteral("savenpc"),
+        QStringLiteral("saveobj"),
+        QStringLiteral("sellgoods"),
+        QStringLiteral("setlevelfile"),
+        QStringLiteral("settimescript")
+    };
+    return functions;
+}
+
+QString enclosingScriptFunctionName(
+    const QString& line,
+    qsizetype stringStart)
+{
+    QStringList callStack;
+    bool inString = false;
+    bool escaped = false;
+    for (qsizetype index = 0; index < stringStart; ++index)
+    {
+        const QChar character = line.at(index);
+        if (inString)
+        {
+            if (escaped)
+            {
+                escaped = false;
+            }
+            else if (character == QLatin1Char('\\'))
+            {
+                escaped = true;
+            }
+            else if (character == QLatin1Char('"'))
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if (character == QLatin1Char('"'))
+        {
+            inString = true;
+            continue;
+        }
+        if (character == QLatin1Char(')'))
+        {
+            if (!callStack.isEmpty())
+                callStack.removeLast();
+            continue;
+        }
+        if (character != QLatin1Char('('))
+            continue;
+
+        qsizetype nameEnd = index;
+        qsizetype nameStart = nameEnd;
+        while (nameStart > 0 && line.at(nameStart - 1).isSpace())
+            --nameStart;
+        nameEnd = nameStart;
+        while (nameStart > 0)
+        {
+            const QChar nameCharacter = line.at(nameStart - 1);
+            if (!nameCharacter.isLetterOrNumber() &&
+                nameCharacter != QLatin1Char('_'))
+            {
+                break;
+            }
+            --nameStart;
+        }
+        callStack.append(line.mid(
+            nameStart, nameEnd - nameStart).toLower());
+    }
+    return callStack.isEmpty() ? QString() : callStack.constLast();
+}
+
+QString lowercaseScriptResourceReferences(const QString& text)
+{
+    static const QRegularExpression stringLiteralPattern(
+        QStringLiteral(R"(\"((?:\\.|[^\"\\])*)\")"));
+    QStringList lines = text.split('\n');
+    for (QString& line : lines)
+    {
+        const int commentPosition = findLineComment(line);
+        const int codeLength = commentPosition >= 0
+            ? commentPosition
+            : line.size();
+        const QString code = line.left(codeLength);
+        struct Replacement
+        {
+            qsizetype start = 0;
+            qsizetype length = 0;
+            QString text;
+        };
+        QList<Replacement> replacements;
+        QRegularExpressionMatchIterator matches =
+            stringLiteralPattern.globalMatch(code);
+        while (matches.hasNext())
+        {
+            const QRegularExpressionMatch match = matches.next();
+            const QString value = match.captured(1);
+            const QString functionName = enclosingScriptFunctionName(
+                code, match.capturedStart(0));
+            if (looksLikeResourceReference(value) ||
+                allStringArgumentsAreResourceReferences().contains(
+                    functionName))
+            {
+                const QString normalized = lowercaseAsciiPath(value);
+                if (normalized != value)
+                {
+                    replacements.append({
+                        match.capturedStart(1),
+                        match.capturedLength(1),
+                        normalized
+                    });
+                }
+            }
+        }
+        for (auto replacement = replacements.crbegin();
+             replacement != replacements.crend(); ++replacement)
+        {
+            line.replace(
+                replacement->start,
+                replacement->length,
+                replacement->text);
+        }
+    }
+    return lines.join('\n');
+}
+
+std::string lowercaseTextResourceReferences(
+    const std::string& content,
+    const QString& extension,
+    bool executableScript)
+{
+    const QString text = QString::fromUtf8(
+        content.data(), static_cast<int>(content.size()));
+    if (executableScript)
+    {
+        return lowercaseScriptResourceReferences(text).
+            toUtf8().toStdString();
+    }
+    if (extension == QStringLiteral("ini") ||
+        extension == QStringLiteral("npc") ||
+        extension == QStringLiteral("obj"))
+    {
+        return lowercaseIniResourceReferences(text).
+            toUtf8().toStdString();
+    }
+    return content;
+}
+
+QStringList scanCallsOutsideStrings(const QString& text)
+{
+    QStringList result;
+    QStringList lines = text.split('\n');
+    for (QString line : lines)
+    {
+        int commentPos = findLineComment(line);
+        if (commentPos >= 0)
+            line = line.left(commentPos);
+
+        bool inString = false;
+        bool escaped = false;
+        for (int i = 0; i < line.size(); i++)
+        {
+            QChar ch = line[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = !inString;
+                continue;
+            }
+            if (inString || !isIdentifierStart(ch))
+                continue;
+
+            int start = i;
+            i++;
+            while (i < line.size() && isIdentifierChar(line[i]))
+                i++;
+
+            int after = i;
+            while (after < line.size() && line[after].isSpace())
+                after++;
+            if (after < line.size() && line[after] == '(')
+                result.append(line.mid(start, i - start).toLower());
+            i--;
+        }
+    }
+    return result;
+}
+}
+
+int JxAssetMigrator::resolveMinimumMagicDamageDefault(
+    const QString& outputDir,
+    const AssetMigrationOptions& options)
+{
+    if (options.minimumMagicDamageDefined &&
+        options.minimumMagicDamage >= 0)
+    {
+        return options.minimumMagicDamage;
+    }
+
+    GameProfile dependencyProfile;
+    if (findDependencyProfile(outputDir, options, dependencyProfile) &&
+        dependencyProfile.minimumMagicDamageDefined)
+    {
+        return dependencyProfile.minimumMagicDamage;
+    }
+
+    return 10;
+}
+
+MagicEffectCalculationMode
+JxAssetMigrator::resolveMagicEffectCalculationModeDefault(
+    const QString& outputDir,
+    const AssetMigrationOptions& options)
+{
+    if (options.magicEffectCalculationModeDefined)
+    {
+        return options.magicEffectCalculationMode;
+    }
+
+    GameProfile dependencyProfile;
+    if (findDependencyProfile(outputDir, options, dependencyProfile) &&
+        dependencyProfile.magicEffectCalculationModeDefined)
+    {
+        return dependencyProfile.magicEffectCalculationMode;
+    }
+
+    return options.modType == 2
+        ? MagicEffectCalculationMode::AddToAttack
+        : MagicEffectCalculationMode::ReplaceAttack;
+}
+
+MigrationResult JxAssetMigrator::migrate(const QString& sourceDir,
+    const QString& outputDir,
+    const AssetMigrationOptions& options,
+    AssetMigrationReport& report,
+    const LogCallback& logCallback,
+    const ProgressCallback& progressCallback,
+    const CancelCallback& cancelCallback)
+{
+    report = AssetMigrationReport();
+    if (sourceDir.trimmed().isEmpty() || outputDir.trimmed().isEmpty())
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 源目录和输出目录都不能为空。"));
+        return MigrationResult::Failed;
+    }
+
+    // Convert to absolute canonical paths so relative sourceDir/outputDir work correctly.
+    // Without this, QDir::cleanPath("月影传说assets") stays relative,
+    // and QDir(sourceRoot).relativeFilePath() embeds the source dir name into output paths.
+    QString sourceRoot = QFileInfo(sourceDir).absoluteFilePath();
+    QString finalOutputRoot = QFileInfo(outputDir).absoluteFilePath();
+    // Normalize separators and resolve .. components
+    sourceRoot = QDir::cleanPath(sourceRoot);
+    finalOutputRoot = QDir::cleanPath(finalOutputRoot);
+    if (AuthoringMutationGate::wouldReplaceResourceCollection(sourceRoot))
+    {
+        report.errorCount++;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 源目录不能是资源集合根或其上级目录；"
+                "请选择一个具体资源包。"));
+        return MigrationResult::Failed;
+    }
+    if (AuthoringMutationGate::wouldReplaceResourceCollection(
+            finalOutputRoot))
+    {
+        report.errorCount++;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 输出目录不能覆盖资源集合根或其上级目录。"));
+        return MigrationResult::Failed;
+    }
+    auto mutationLease =
+        AuthoringMutationGate::instance().
+            acquireMutationLeaseForPath(finalOutputRoot);
+    if (!mutationLease)
+    {
+        report.errorCount++;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 输出资源正在更新或进行其他写入。"));
+        return MigrationResult::Failed;
+    }
+    if (!mutationLease.addResourcePath(sourceRoot))
+    {
+        report.errorCount++;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 源资源正在更新或进行其他写入。"));
+        return MigrationResult::Failed;
+    }
+
+    QFileInfo sourceInfo(sourceRoot);
+    if (isFileSystemLink(sourceInfo))
+    {
+        report.errorCount++;
+        appendFileOutcome(
+            report,
+            QStringLiteral("."),
+            QString(),
+            AssetResourceType::Other,
+            AssetMigrationFileAction::Fail,
+            QStringLiteral(
+                "source-root-link-not-supported"),
+            QString::fromUtf8(
+                "源目录根是文件系统链接；转换不会跟随该链接"),
+            true,
+            migrationEntryType(sourceInfo));
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 源目录根不能是 symlink/junction: %1")
+                .arg(sourceRoot));
+        return MigrationResult::Failed;
+    }
+    if (!sourceInfo.exists() || !sourceInfo.isDir())
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 源目录不存在或不是目录: %1").arg(sourceRoot));
+        return MigrationResult::Failed;
+    }
+    const QString canonicalSourceRoot = sourceInfo.canonicalFilePath();
+    if (!canonicalSourceRoot.isEmpty())
+        sourceRoot = QDir::cleanPath(canonicalSourceRoot);
+
+    QList<AssetResourceType> resourceTypes;
+    if (!normalizeResourceTypes(options.resourceTypes, resourceTypes))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 资源域必须是 all 或一个以上互不冲突的 scripts/maps/images/audio。"));
+        return MigrationResult::Failed;
+    }
+    initializeResourceDomainReport(report, resourceTypes);
+
+    AssetMigrationOptions effectiveOptions = options;
+    effectiveOptions.resourceTypes = resourceTypes;
+    if (effectiveOptions.modId.trimmed().isEmpty())
+        effectiveOptions.modId = QFileInfo(finalOutputRoot).fileName();
+
+    GameProfile sourceProfile;
+    const QString sourceManifestPath =
+        ResourcePackScanner::manifestPath(sourceRoot);
+    if (sourceProfile.loadFromFile(sourceManifestPath))
+    {
+        INIFileEditor sourceManifest;
+        const bool titleMusicIsExplicit =
+            sourceManifest.loadFromFile(
+                sourceManifestPath.toStdString()) &&
+            sourceManifest.hasKey("Title", "Music");
+        applyExplicitProfileValues(
+            sourceProfile,
+            titleMusicIsExplicit,
+            effectiveOptions);
+        if (effectiveOptions.uiProfile.trimmed().isEmpty())
+        {
+            effectiveOptions.uiProfile = sourceProfile.uiProfile;
+        }
+    }
+    ResourcePackInfo dependencyPack;
+    const bool dependencyProfileFound = findDependencyPack(
+        finalOutputRoot,
+        effectiveOptions,
+        dependencyIds(effectiveOptions.dependencyId),
+        dependencyPack);
+    GameProfile dependencyProfile;
+    if (dependencyProfileFound)
+    {
+        if (!mutationLease.addResourcePath(dependencyPack.rootPath))
+        {
+            report.errorCount++;
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 依赖资源正在更新，无法取得一致的转换基底。"));
+            return MigrationResult::Failed;
+        }
+        const QString dependencyManifestPath =
+            ResourcePackScanner::manifestPath(dependencyPack.rootPath);
+        if (!dependencyProfile.loadFromFile(dependencyManifestPath) ||
+            dependencyProfile.id.compare(
+                dependencyPack.profile.id, Qt::CaseSensitive) != 0)
+        {
+            report.errorCount++;
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 依赖资源在转换开始前发生变化，请重新执行转换。"));
+            return MigrationResult::Failed;
+        }
+        applyProfileDefaults(dependencyProfile, effectiveOptions);
+    }
+    else
+    {
+        applyTypeFallbackDefaults(effectiveOptions);
+    }
+    if (!effectiveOptions.minimumMagicDamageDefined)
+    {
+        effectiveOptions.minimumMagicDamage = 10;
+        effectiveOptions.minimumMagicDamageDefined = true;
+    }
+    if (!effectiveOptions.magicEffectCalculationModeDefined)
+    {
+        effectiveOptions.magicEffectCalculationMode =
+            resolveMagicEffectCalculationModeDefault(
+                finalOutputRoot, effectiveOptions);
+        effectiveOptions.magicEffectCalculationModeDefined = true;
+    }
+
+    const bool completeProject = isCompleteProjectMigration(resourceTypes);
+    const bool imageSubsetMigration = resourceTypes.size() == 1 &&
+        resourceTypes.first() == AssetResourceType::Images &&
+        !options.includePrefix.isEmpty();
+    const bool writesFullProfile = options.writeModProfile && completeProject;
+    if ((!options.includePrefix.isEmpty() && !imageSubsetMigration) ||
+        (imageSubsetMigration && !isSafeRelativeSubdirectory(options.includePrefix)) ||
+        options.modType < -1 || options.modType > 3 ||
+        (writesFullProfile && hasUnsafeProfileText(effectiveOptions)) ||
+        (options.sourceEncoding.compare("gbk", Qt::CaseInsensitive) != 0 &&
+         options.sourceEncoding.compare("utf8", Qt::CaseInsensitive) != 0) ||
+        (writesFullProfile && options.modType < 0 &&
+         firstDependencyId(options.dependencyId).isEmpty()))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 转换选项组合无效；继承 Type 需要内容依赖，"
+                "图片子集需要安全的相对 includePrefix，配置字段不能包含换行或 NUL。"));
+        return MigrationResult::Failed;
+    }
+    QString uiBaseRoot;
+    if (completeProject)
+    {
+        bool authoritativeUiProfile = false;
+        const UiWindowDefaultProfile detectedUiProfile =
+            detectUiWindowDefaultProfile(
+                sourceRoot,
+                effectiveOptions,
+                &authoritativeUiProfile);
+        if (!authoritativeUiProfile &&
+            effectiveOptions.uiProfile.trimmed().isEmpty() &&
+            dependencyProfileFound &&
+            !dependencyProfile.uiProfile.trimmed().isEmpty())
+        {
+            effectiveOptions.uiProfile =
+                dependencyProfile.uiProfile.trimmed();
+        }
+        else
+        {
+            effectiveOptions.uiProfile =
+                uiWindowDefaultProfileName(detectedUiProfile);
+        }
+        if (effectiveOptions.uiBaseId.trimmed().isEmpty() &&
+            authoritativeUiProfile &&
+            !effectiveOptions.dependencyId.trimmed().isEmpty() &&
+            effectiveOptions.uiProfile.trimmed().compare(
+                firstDependencyId(effectiveOptions.dependencyId), Qt::CaseInsensitive) != 0)
+        {
+            // 例如内容依赖 JXQY2、但源 UI 检测为 YYCS 的 Mod：
+            // 仅在两个域明确不同时写入独立 UI 基底，避免基础资源包自依赖。
+            effectiveOptions.uiBaseId = effectiveOptions.uiProfile.trimmed().toUpper();
+        }
+        GameProfile selectedUiBaseProfile;
+        uiBaseRoot = findUiBaseRoot(
+            finalOutputRoot,
+            effectiveOptions,
+            &selectedUiBaseProfile);
+        if (!uiBaseRoot.isEmpty())
+        {
+            if (!mutationLease.addResourcePath(uiBaseRoot))
+            {
+                report.errorCount++;
+                appendReportLog(
+                    report,
+                    logCallback,
+                    QString::fromUtf8(
+                        "错误: UI 基底资源正在更新，无法取得一致快照。"));
+                return MigrationResult::Failed;
+            }
+            GameProfile lockedUiBaseProfile;
+            if (!lockedUiBaseProfile.loadFromFile(
+                    ResourcePackScanner::manifestPath(uiBaseRoot)) ||
+                lockedUiBaseProfile.id.compare(
+                    selectedUiBaseProfile.id, Qt::CaseSensitive) != 0)
+            {
+                report.errorCount++;
+                appendReportLog(
+                    report,
+                    logCallback,
+                    QString::fromUtf8(
+                        "错误: UI 基底资源在转换开始前发生变化，请重新执行转换。"));
+                return MigrationResult::Failed;
+            }
+        }
+    }
+    for (const LegacyImageCategoryDefinition& item :
+         LegacyImageMigrationPolicy::definitions())
+    {
+        report.legacyImageModes.insert(item.id,
+            LegacyImageMigrationPolicy::modeId(
+                effectiveOptions.legacyImages.mode(item.category)));
+    }
+    report.cropTransparentRequested =
+        effectiveOptions.legacyImages.cropTransparent();
+    report.cropTransparentEffective =
+        effectiveOptions.legacyImages.effectiveCropTransparent();
+
+    // Reject source=output same directory — would corrupt source and skip file scanning
+    const Qt::CaseSensitivity pathCaseSensitivity = fileSystemPathCaseSensitivity();
+    const QString comparisonOutputRoot =
+        pathWithCanonicalExistingAncestor(finalOutputRoot);
+    if (sourceRoot.compare(comparisonOutputRoot, pathCaseSensitivity) == 0)
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 源目录和输出目录不能相同: %1").arg(sourceRoot));
+        return MigrationResult::Failed;
+    }
+    QString sourcePrefix = QDir::fromNativeSeparators(sourceRoot);
+    if (!sourcePrefix.endsWith('/'))
+        sourcePrefix += '/';
+    QString normalizedOutputRoot = QDir::fromNativeSeparators(comparisonOutputRoot);
+    if (normalizedOutputRoot.startsWith(sourcePrefix, pathCaseSensitivity))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 输出目录不能位于源目录内部: %1").arg(finalOutputRoot));
+        return MigrationResult::Failed;
+    }
+    QString outputPrefix = normalizedOutputRoot;
+    if (!outputPrefix.endsWith('/'))
+        outputPrefix += '/';
+    QString normalizedSourceRoot = QDir::fromNativeSeparators(sourceRoot);
+    if (normalizedSourceRoot.startsWith(outputPrefix, pathCaseSensitivity))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 源目录不能位于输出目录内部: %1").arg(sourceRoot));
+        return MigrationResult::Failed;
+    }
+
+    QFileInfo outputInfo(finalOutputRoot);
+    if (isFileSystemLink(outputInfo))
+    {
+        report.errorCount++;
+        appendFileOutcome(
+            report,
+            QStringLiteral("."),
+            QStringLiteral("."),
+            AssetResourceType::Other,
+            AssetMigrationFileAction::Fail,
+            QStringLiteral(
+                "existing-output-root-link-not-supported"),
+            QString::fromUtf8(
+                "旧输出根是文件系统链接；转换不会跟随该链接"),
+            false,
+            migrationEntryType(outputInfo));
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 输出目录根不能是 symlink/junction: %1")
+                .arg(finalOutputRoot));
+        return MigrationResult::Failed;
+    }
+    if (outputInfo.exists() && !outputInfo.isDir())
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 输出路径必须是普通目录: %1").arg(finalOutputRoot));
+        return MigrationResult::Failed;
+    }
+
+    QDir outputDirectory(finalOutputRoot);
+    if (QDir(comparisonOutputRoot).isRoot())
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 输出目录不能是磁盘根目录: %1").arg(finalOutputRoot));
+        return MigrationResult::Failed;
+    }
+    if (outputDirectory.exists())
+    {
+        QFileInfoList existingEntries = outputDirectory.entryInfoList(
+            QDir::AllEntries | QDir::NoDotAndDotDot);
+        if (!existingEntries.isEmpty())
+        {
+            if (completeProject)
+            {
+                bool isPreviousMigration =
+                    QFileInfo(outputDirectory.filePath("migration_report.json")).isFile() ||
+                    QFileInfo(outputDirectory.filePath("migration_report.txt")).isFile() ||
+                    QFileInfo(outputDirectory.filePath(kMigrationMarkerFileName)).isFile();
+                if (!isPreviousMigration)
+                {
+                    report.errorCount++;
+                    appendReportLog(report, logCallback,
+                        QString::fromUtf8(
+                            "错误: 输出目录非空且不是旧转换目录，请选择空目录: %1")
+                            .arg(finalOutputRoot));
+                    return MigrationResult::Failed;
+                }
+            }
+        }
+    }
+    const ManagedOutputDigestMap
+        previousManagedOutputs =
+            readMigrationMarkerProvenance(
+                finalOutputRoot);
+
+    const QString outputParent = QFileInfo(finalOutputRoot).absolutePath();
+    if (!QDir().mkpath(outputParent))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 无法创建转换输出父目录: %1").arg(outputParent));
+        return MigrationResult::Failed;
+    }
+
+    QString stagingTemplate = QDir(outputParent).filePath(
+        "." + QFileInfo(finalOutputRoot).fileName() + ".migration-XXXXXX");
+    auto stagingDirectory = std::make_unique<QTemporaryDir>(stagingTemplate);
+    if (!stagingDirectory->isValid())
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 无法创建转换暂存目录: %1").arg(stagingTemplate));
+        return MigrationResult::Failed;
+    }
+    const QString outputRoot = stagingDirectory->path();
+
+    if (completeProject && !writeMigrationMarkerFile(outputRoot))
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 无法写入转换输出标记: %1")
+                .arg(appendPath(outputRoot, kMigrationMarkerFileName)));
+        return MigrationResult::Failed;
+    }
+
+    appendReportLog(report, logCallback, QString::fromUtf8("资源格式转换源目录: %1").arg(sourceRoot));
+    appendReportLog(report, logCallback, QString::fromUtf8("资源格式转换输出目录: %1").arg(finalOutputRoot));
+    appendReportLog(report, logCallback,
+        QString::fromUtf8("资源域: %1").arg(report.selectedResourceTypes.join(QStringLiteral(", "))));
+    QStringList imageModes;
+    for (const LegacyImageCategoryDefinition& item :
+         LegacyImageMigrationPolicy::definitions())
+    {
+        imageModes.append(QStringLiteral("%1=%2")
+            .arg(item.id, report.legacyImageModes.value(item.id)));
+    }
+    appendReportLog(report, logCallback,
+        QString::fromUtf8("旧图片策略: %1；透明裁剪请求值=%2；透明裁剪有效值=%3")
+            .arg(imageModes.join(QStringLiteral(", ")),
+                report.cropTransparentRequested
+                    ? QStringLiteral("true") : QStringLiteral("false"),
+                report.cropTransparentEffective
+                    ? QStringLiteral("true") : QStringLiteral("false")));
+
+    auto preserveFailedStaging = [&](bool wasCancelled) {
+        report.cancelled = report.cancelled || wasCancelled;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("未发布失败/取消的转换结果；诊断暂存目录保留在: %1")
+                .arg(outputRoot));
+        writeReportFile(outputRoot, report);
+        writeReportJsonFile(outputRoot, report, MigrationResult::Failed);
+        stagingDirectory->setAutoRemove(false);
+        if (!report.reportFilePath.isEmpty())
+        {
+            appendReportLog(report, logCallback,
+                QString::fromUtf8("转换报告: %1").arg(report.reportFilePath));
+        }
+        return MigrationResult::Failed;
+    };
+
+    QStringList allDirectories;
+    QStringList allFiles;
+    QDirIterator iterator(
+        sourceRoot,
+        QDir::AllEntries |
+            QDir::NoDotAndDotDot |
+            QDir::Hidden |
+            QDir::System,
+        QDirIterator::Subdirectories);
+    QDir sourceDirObj(sourceRoot);
+    while (iterator.hasNext())
+    {
+        if (cancelCallback && cancelCallback())
+        {
+            report.cancelled = true;
+            break;
+        }
+        const QString path = iterator.next();
+        const QFileInfo information(path);
+        if (information.isDir())
+            allDirectories.append(path);
+        else
+            allFiles.append(path);
+    }
+    allDirectories.sort(Qt::CaseSensitive);
+    allFiles.sort(Qt::CaseSensitive);
+
+    QMap<QString, bool>
+        scannedSourcePathIsDirectory;
+    const auto reserveScannedSourcePath =
+        [&](const QString& sourcePath,
+            bool ordinaryDirectory)
+    {
+        const QString sourceRelativePath =
+            normalizePath(
+                sourceDirObj.relativeFilePath(
+                    sourcePath));
+        const QString outputPathKey =
+            lowerPathKey(
+                mapOutputRelativePath(
+                    sourceRelativePath));
+        const auto existing =
+            scannedSourcePathIsDirectory.
+                constFind(outputPathKey);
+        scannedSourcePathIsDirectory.insert(
+            outputPathKey,
+            existing ==
+                    scannedSourcePathIsDirectory.
+                        cend()
+                ? ordinaryDirectory
+                : existing.value() &&
+                      ordinaryDirectory);
+    };
+    for (const QString& directoryPath :
+         allDirectories)
+    {
+        const QFileInfo information(
+            directoryPath);
+        reserveScannedSourcePath(
+            directoryPath,
+            information.isDir() &&
+                !isFileSystemLink(
+                    information));
+    }
+    for (const QString& filePath :
+         allFiles)
+    {
+        reserveScannedSourcePath(
+            filePath,
+            false);
+    }
+
+    QSet<QString> legacyNewGameSaveTemplatePaths;
+    for (const QString& filePath : allFiles)
+    {
+        const QString relativePath =
+            normalizePath(
+                sourceDirObj.relativeFilePath(
+                    filePath));
+        QString mappedSaveTemplatePath;
+        if (mapLegacyNewGameSaveTemplatePath(
+                relativePath,
+                mappedSaveTemplatePath))
+        {
+            legacyNewGameSaveTemplatePaths.insert(
+                lowerPathKey(
+                    mappedSaveTemplatePath));
+        }
+    }
+
+    struct SourceOutputCandidate
+    {
+        QString sourcePath;
+        QString outputPath;
+        bool directory = false;
+    };
+    QList<SourceOutputCandidate>
+        sourceOutputCandidates;
+    bool sourceProvidesModProfile = false;
+    auto registerSourceOutput =
+        [&](const QString& sourceRelativePath,
+            const QString& outputRelativePath,
+            bool directory = false)
+    {
+        SourceOutputCandidate candidate;
+        candidate.sourcePath =
+            sourceRelativePath;
+        candidate.outputPath =
+            outputRelativePath;
+        candidate.directory = directory;
+        sourceOutputCandidates.append(
+            std::move(candidate));
+    };
+
+    if (!report.cancelled)
+    {
+        for (const QString& directoryPath :
+             allDirectories)
+        {
+            const QFileInfo information(
+                directoryPath);
+            const QString relativePath =
+                normalizePath(
+                    sourceDirObj.relativeFilePath(
+                        directoryPath));
+            const AssetResourceType resourceType =
+                resourceTypeForRelativePath(
+                    relativePath);
+            if (isFileSystemLink(information) ||
+                isIgnoredLegacyNonRuntimeFile(
+                    directoryPath,
+                    relativePath) ||
+                (!completeProject &&
+                 !resourceTypes.contains(
+                     resourceType)) ||
+                (!options.includePrefix.isEmpty() &&
+                 !relativePathMatchesPrefix(
+                     relativePath,
+                     options.includePrefix)))
+            {
+                continue;
+            }
+            registerSourceOutput(
+                relativePath,
+                mapOutputRelativePath(
+                    relativePath), true);
+        }
+
+        for (const QString& filePath :
+             allFiles)
+        {
+            const QFileInfo information(filePath);
+            const QString sourceRelativePath =
+                normalizePath(
+                    sourceDirObj.relativeFilePath(
+                        filePath));
+            QString relativePath =
+                sourceRelativePath;
+            QString mappedSaveTemplatePath;
+            const bool isLegacySaveTemplate =
+                mapLegacyNewGameSaveTemplatePath(
+                    relativePath,
+                    mappedSaveTemplatePath);
+            if (!isLegacySaveTemplate &&
+                legacyNewGameSaveTemplatePaths.
+                    contains(
+                        lowerPathKey(
+                            relativePath)))
+            {
+                continue;
+            }
+            if (isLegacySaveTemplate)
+                relativePath =
+                    mappedSaveTemplatePath;
+            const AssetResourceType resourceType =
+                resourceTypeForRelativePath(
+                    relativePath);
+            if (isFileSystemLink(information) ||
+                isIgnoredLegacyNonRuntimeFile(
+                    filePath,
+                    relativePath) ||
+                (!completeProject &&
+                 !resourceTypes.contains(
+                     resourceType)) ||
+                (!options.includePrefix.isEmpty() &&
+                 !relativePathMatchesPrefix(
+                     relativePath,
+                     options.includePrefix)))
+            {
+                continue;
+            }
+            const std::optional<
+                LegacyImageCategory>
+                legacyImageCategory =
+                    LegacyImageMigrationPolicy::
+                        classifyRelativePath(
+                            relativePath);
+            if (legacyImageCategory.has_value() &&
+                !LegacyImageMigrationPolicy::
+                     definition(
+                         *legacyImageCategory).
+                     entersOutput)
+            {
+                continue;
+            }
+            const QString outputRelativePath =
+                mapOutputRelativePath(
+                    relativePath);
+            if (lowerPathKey(
+                    outputRelativePath) ==
+                QStringLiteral(
+                    "game_profile.ini"))
+            {
+                sourceProvidesModProfile = true;
+            }
+            registerSourceOutput(
+                sourceRelativePath,
+                outputRelativePath);
+        }
+    }
+
+    QMap<QString, QList<int>> audioOutputOwners;
+    for (int index = 0; index < sourceOutputCandidates.size(); ++index)
+        audioOutputOwners[canonicalMigrationPathKey(sourceOutputCandidates[index].outputPath)].append(index);
+    QSet<QString> redundantContentAudioSources;
+    QSet<QString> equivalentPcmContentAudioSources;
+    QSet<QString> mergedContentAudioDirectories;
+    for (const QList<int>& owners : audioOutputOwners)
+    {
+        if (owners.size() != 2)
+            continue;
+        const SourceOutputCandidate* content = &sourceOutputCandidates[owners[0]];
+        const SourceOutputCandidate* direct = &sourceOutputCandidates[owners[1]];
+        if (!isLegacyContentAudioPath(content->sourcePath))
+            std::swap(content, direct);
+        if (!isLegacyContentAudioPath(content->sourcePath) || isLegacyContentAudioPath(direct->sourcePath) ||
+            content->directory != direct->directory)
+        {
+            continue;
+        }
+        if (content->directory)
+        {
+            mergedContentAudioDirectories.insert(content->sourcePath);
+            continue;
+        }
+        const QString contentPath = appendPath(sourceRoot, content->sourcePath);
+        const QString directPath = appendPath(sourceRoot, direct->sourcePath);
+        QString contentDigest;
+        QString directDigest;
+        QByteArray convertedWav;
+        bool contentRead = false;
+        if (isLegacyXnbSound(content->sourcePath))
+        {
+            QString error;
+            contentRead = decodeLegacyXnbSound(contentPath, convertedWav, error);
+            if (contentRead)
+                contentDigest = QString::fromLatin1(QCryptographicHash::hash(convertedWav, QCryptographicHash::Sha256).toHex());
+        }
+        else
+        {
+            contentRead = calculateFileSha256(contentPath, contentDigest);
+        }
+        if (contentRead && calculateFileSha256(directPath, directDigest))
+        {
+            if (contentDigest != directDigest)
+            {
+                if (convertedWav.isEmpty() || !hasSamePcmWaveSamples(convertedWav, directPath))
+                    continue;
+                equivalentPcmContentAudioSources.insert(content->sourcePath);
+            }
+            redundantContentAudioSources.insert(content->sourcePath);
+        }
+    }
+
+    QList<QPair<QString, QString>>
+        sourceOutputPaths;
+    for (const SourceOutputCandidate& candidate :
+         sourceOutputCandidates)
+    {
+        if (redundantContentAudioSources.contains(candidate.sourcePath) ||
+            mergedContentAudioDirectories.contains(candidate.sourcePath))
+        {
+            continue;
+        }
+        sourceOutputPaths.append(
+            qMakePair(
+                candidate.sourcePath,
+                candidate.outputPath));
+    }
+    QMap<QString, QString>
+        generatedProducerOutputs;
+    const bool scriptsSelectedForPreflight =
+        completeProject ||
+        resourceTypes.contains(
+            AssetResourceType::Scripts);
+    const QFileInfo talkIndexSource(
+        appendPath(
+            sourceRoot,
+            QStringLiteral(
+                "script/common/Talkidx.dat")));
+    const QFileInfo talkDataSource(
+        appendPath(
+            sourceRoot,
+            QStringLiteral(
+                "script/common/Talk.dat")));
+    if (scriptsSelectedForPreflight &&
+        talkIndexSource.isFile() &&
+        !isFileSystemLink(talkIndexSource) &&
+        talkDataSource.isFile() &&
+        !isFileSystemLink(talkDataSource))
+    {
+        const QString commonProducer =
+            QStringLiteral(
+                "<generated:talk-dat-index:common>");
+        const QString rootProducer =
+            QStringLiteral(
+                "<generated:talk-dat-index:root>");
+        const QString commonOutput =
+            QStringLiteral(
+                "script/common/talkindex.txt");
+        const QString rootOutput =
+            QStringLiteral("talkindex.txt");
+        sourceOutputPaths.append(
+            qMakePair(
+                commonProducer,
+                commonOutput));
+        sourceOutputPaths.append(
+            qMakePair(
+                rootProducer,
+                rootOutput));
+        generatedProducerOutputs.insert(
+            commonProducer,
+            commonOutput);
+        generatedProducerOutputs.insert(
+            rootProducer,
+            rootOutput);
+    }
+    const QStringList collisionSourceList =
+        assetMigrationOutputPathCollisionSources(
+            sourceOutputPaths);
+    const QSet<QString> collidingSourcePaths(
+        collisionSourceList.cbegin(),
+        collisionSourceList.cend());
+
+    if (!collidingSourcePaths.isEmpty())
+    {
+        for (const QString& directoryPath :
+             allDirectories)
+        {
+            const QString sourceRelativePath =
+                normalizePath(
+                    sourceDirObj.relativeFilePath(
+                        directoryPath));
+            const bool collision =
+                collidingSourcePaths.contains(
+                    sourceRelativePath);
+            QString outputRelativePath =
+                mapOutputRelativePath(
+                    sourceRelativePath);
+            QString message;
+            if (collision)
+            {
+                message = QString::fromUtf8(
+                    "多个源目录项映射到同一大小写不敏感输出路径");
+            }
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceTypeForRelativePath(
+                    sourceRelativePath),
+                collision
+                    ? AssetMigrationFileAction::Fail
+                    : AssetMigrationFileAction::Skip,
+                collision
+                    ? QStringLiteral(
+                          "source-output-path-collision")
+                    : QStringLiteral(
+                          "migration-aborted-by-output-path-collision"),
+                message,
+                true,
+                migrationEntryType(
+                    QFileInfo(directoryPath)));
+            if (collision)
+            {
+                domainReportFor(
+                    report,
+                    resourceTypeForRelativePath(
+                        sourceRelativePath)).
+                    failedFiles++;
+                report.errorCount++;
+            }
+        }
+        for (const QString& filePath :
+             allFiles)
+        {
+            const QString sourceRelativePath =
+                normalizePath(
+                    sourceDirObj.relativeFilePath(
+                        filePath));
+            const bool collision =
+                collidingSourcePaths.contains(
+                    sourceRelativePath);
+            QString relativePath =
+                sourceRelativePath;
+            QString mappedSaveTemplatePath;
+            if (mapLegacyNewGameSaveTemplatePath(
+                    relativePath,
+                    mappedSaveTemplatePath))
+            {
+                relativePath =
+                    mappedSaveTemplatePath;
+            }
+            const QString outputRelativePath =
+                mapOutputRelativePath(
+                    relativePath);
+            QString message;
+            if (collision)
+            {
+                message = QString::fromUtf8(
+                    "多个源文件或目录项映射到同一大小写不敏感输出路径");
+            }
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceTypeForRelativePath(
+                    relativePath),
+                collision
+                    ? AssetMigrationFileAction::Fail
+                    : AssetMigrationFileAction::Skip,
+                collision
+                    ? QStringLiteral(
+                          "source-output-path-collision")
+                    : QStringLiteral(
+                          "migration-aborted-by-output-path-collision"),
+                message,
+                true,
+                migrationEntryType(
+                    QFileInfo(filePath)));
+            if (collision)
+            {
+                domainReportFor(
+                    report,
+                    resourceTypeForRelativePath(
+                        relativePath)).
+                    failedFiles++;
+                report.errorCount++;
+            }
+        }
+        for (auto generated =
+                 generatedProducerOutputs.cbegin();
+             generated !=
+                 generatedProducerOutputs.cend();
+             ++generated)
+        {
+            if (!collidingSourcePaths.contains(
+                    generated.key()))
+            {
+                continue;
+            }
+            appendFileOutcome(
+                report,
+                QStringLiteral(
+                    "script/common/Talk.dat + "
+                    "script/common/Talkidx.dat"),
+                generated.value(),
+                AssetResourceType::Scripts,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "generated-output-path-collision"),
+                QString::fromUtf8(
+                    "Talk.dat/Talkidx.dat 复合转换输出"
+                    "与显式源 talkindex 文件冲突"),
+                false);
+            domainReportFor(
+                report,
+                AssetResourceType::Scripts).
+                failedFiles++;
+            report.errorCount++;
+        }
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 多个源目录项映射到同一输出路径；"
+                "未写入任何源资源，取消发布。"));
+        return preserveFailedStaging(false);
+    }
+
+    QSet<QString> directoryMatchedDomains;
+    QString publishedImagePrefix;
+    for (int directoryIndex = 0;
+         directoryIndex < allDirectories.size();
+         ++directoryIndex)
+    {
+        const QString directoryPath =
+            allDirectories[directoryIndex];
+        const QFileInfo directoryInformation(
+            directoryPath);
+        const QString sourceRelativePath =
+            normalizePath(
+                sourceDirObj.relativeFilePath(
+                    directoryPath));
+        const AssetResourceType resourceType =
+            resourceTypeForRelativePath(
+                sourceRelativePath);
+        const QString outputRelativePath =
+            mapOutputRelativePath(
+                sourceRelativePath);
+        const QString entryType =
+            migrationEntryType(
+                directoryInformation);
+
+        if (report.cancelled ||
+            (cancelCallback && cancelCallback()))
+        {
+            report.cancelled = true;
+            for (int remaining = directoryIndex;
+                 remaining < allDirectories.size();
+                 ++remaining)
+            {
+                const QString remainingPath =
+                    allDirectories[remaining];
+                const QFileInfo remainingInformation(
+                    remainingPath);
+                const QString remainingRelativePath =
+                    normalizePath(
+                        sourceDirObj.relativeFilePath(
+                            remainingPath));
+                appendFileOutcome(
+                    report,
+                    remainingRelativePath,
+                    mapOutputRelativePath(
+                        remainingRelativePath),
+                    resourceTypeForRelativePath(
+                        remainingRelativePath),
+                    AssetMigrationFileAction::Skip,
+                    QStringLiteral(
+                        "migration-cancelled-before-processing"),
+                    QString::fromUtf8(
+                        "转换取消，目录未处理"),
+                    true,
+                    migrationEntryType(
+                        remainingInformation));
+            }
+            break;
+        }
+
+        if (isFileSystemLink(
+                directoryInformation))
+        {
+            domainReportFor(
+                report,
+                resourceType).failedFiles++;
+            report.errorCount++;
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "source-directory-link-not-supported"),
+                QString::fromUtf8(
+                    "转换不会跟随源目录中的目录 symlink/junction"),
+                true,
+                entryType);
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 源目录项是目录链接，未跟随 %1")
+                    .arg(sourceRelativePath));
+            continue;
+        }
+
+        if (isIgnoredLegacyNonRuntimeFile(
+                directoryPath,
+                sourceRelativePath))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                QString(),
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "known-non-runtime-directory"),
+                QString::fromUtf8(
+                    "已识别的存档、旧生成物或非运行时目录不进入发布"),
+                true,
+                QStringLiteral("directory"));
+            continue;
+        }
+        if (!completeProject &&
+            !resourceTypes.contains(resourceType))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "resource-domain-not-selected"),
+                QString::fromUtf8(
+                    "目录不属于本次选择的资源域"),
+                true,
+                QStringLiteral("directory"));
+            continue;
+        }
+        if (!options.includePrefix.isEmpty() &&
+            !relativePathMatchesPrefix(
+                sourceRelativePath,
+                options.includePrefix))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "include-prefix-not-selected"),
+                QString::fromUtf8(
+                    "目录不在本次图片子集前缀内"),
+                true,
+                QStringLiteral("directory"));
+            continue;
+        }
+
+        if (imageSubsetMigration &&
+            publishedImagePrefix.isEmpty())
+        {
+            publishedImagePrefix =
+                normalizePath(
+                    mapOutputRelativePath(
+                        matchedCasePreservingPrefix(
+                            sourceRelativePath,
+                            options.includePrefix)));
+        }
+        directoryMatchedDomains.insert(
+            assetResourceTypeId(
+                resourceType));
+        const QString outputPath =
+            appendPath(
+                outputRoot,
+                outputRelativePath);
+        if (!QDir().mkpath(outputPath))
+        {
+            domainReportFor(
+                report,
+                resourceType).failedFiles++;
+            report.errorCount++;
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "source-directory-preserve-failed"),
+                QString::fromUtf8(
+                    "无法在暂存输出中创建源目录"),
+                true,
+                QStringLiteral("directory"));
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 无法转换源目录项 %1")
+                    .arg(sourceRelativePath));
+            continue;
+        }
+
+        appendFileOutcome(
+            report,
+            sourceRelativePath,
+            outputRelativePath,
+            resourceType,
+            AssetMigrationFileAction::Copy,
+            QStringLiteral(
+                "preserve-source-directory"),
+            QString::fromUtf8(
+                "保留源目录项；空目录不会在转换中丢失"),
+            true,
+            QStringLiteral("directory"));
+    }
+
+    for (int i = 0; i < allFiles.size(); i++)
+    {
+        if (report.cancelled ||
+            (cancelCallback && cancelCallback()))
+        {
+            report.cancelled = true;
+            appendReportLog(report, logCallback, QString::fromUtf8("用户取消资源格式转换。"));
+            for (int remaining = i;
+                 remaining < allFiles.size();
+                 ++remaining)
+            {
+                const QString remainingSourcePath =
+                    normalizePath(
+                        sourceDirObj.relativeFilePath(
+                            allFiles[remaining]));
+                QString remainingOutputPath =
+                    remainingSourcePath;
+                QString mappedPath;
+                if (mapLegacyNewGameSaveTemplatePath(
+                        remainingSourcePath,
+                        mappedPath))
+                {
+                    remainingOutputPath = mappedPath;
+                }
+                remainingOutputPath =
+                    mapOutputRelativePath(
+                        remainingOutputPath);
+                appendFileOutcome(
+                    report,
+                    remainingSourcePath,
+                    remainingOutputPath,
+                    resourceTypeForRelativePath(
+                        remainingOutputPath),
+                    AssetMigrationFileAction::Skip,
+                    QStringLiteral(
+                        "migration-cancelled-before-processing"),
+                    QString::fromUtf8(
+                        "转换取消，文件未处理"));
+            }
+            break;
+        }
+
+        QString filePath = allFiles[i];
+        const QString sourceRelativePath =
+            normalizePath(
+                sourceDirObj.relativeFilePath(filePath));
+        QString relativePath = sourceRelativePath;
+        if (progressCallback)
+        {
+            progressCallback(
+                i + 1,
+                allFiles.size(),
+                sourceRelativePath);
+        }
+
+        QString mappedSaveTemplatePath;
+        const bool isLegacyNewGameSaveTemplate =
+            mapLegacyNewGameSaveTemplatePath(relativePath, mappedSaveTemplatePath);
+        if (!isLegacyNewGameSaveTemplate &&
+            legacyNewGameSaveTemplatePaths.contains(lowerPathKey(relativePath)))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                mapOutputRelativePath(relativePath),
+                resourceTypeForRelativePath(relativePath),
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "superseded-by-legacy-save-template"),
+                QString::fromUtf8(
+                    "同一路径由 save/rpg0 旧存档模板转换结果提供"));
+            continue;
+        }
+        if (isLegacyNewGameSaveTemplate)
+            relativePath = mappedSaveTemplatePath;
+        const QFileInfo sourceFileInformation(
+            filePath);
+        if (isFileSystemLink(
+                sourceFileInformation))
+        {
+            const AssetResourceType linkedResourceType =
+                resourceTypeForRelativePath(
+                    relativePath);
+            const QString linkedOutputRelativePath =
+                mapOutputRelativePath(
+                    relativePath);
+            report.processedFiles++;
+            AssetResourceDomainReport& resourceDomainReport =
+                domainReportFor(
+                    report,
+                    linkedResourceType);
+            resourceDomainReport.processedFiles++;
+            resourceDomainReport.failedFiles++;
+            report.errorCount++;
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                linkedOutputRelativePath,
+                linkedResourceType,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "source-file-link-not-supported"),
+                QString::fromUtf8(
+                    "转换不会跟随源目录中的文件 symlink"),
+                true,
+                migrationEntryType(
+                    sourceFileInformation));
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 源文件是链接，未复制 %1")
+                    .arg(sourceRelativePath));
+            continue;
+        }
+        if (isIgnoredLegacyNonRuntimeFile(filePath, relativePath))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                QString(),
+                resourceTypeForRelativePath(relativePath),
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "known-non-runtime-file"),
+                QString::fromUtf8(
+                    "已识别的二进制、归档、存档或旧转换报告不进入发布"));
+            continue;
+        }
+
+        const AssetResourceType resourceType =
+            resourceTypeForRelativePath(relativePath);
+        if (!completeProject && !resourceTypes.contains(resourceType))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                mapOutputRelativePath(relativePath),
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "resource-domain-not-selected"),
+                QString::fromUtf8(
+                    "文件不属于本次选择的资源域"));
+            continue;
+        }
+        QString outputRelativePath = mapOutputRelativePath(relativePath);
+        QString outputPath = appendPath(outputRoot, outputRelativePath);
+        if (redundantContentAudioSources.contains(sourceRelativePath))
+        {
+            appendFileOutcome(report, sourceRelativePath, outputRelativePath, resourceType,
+                AssetMigrationFileAction::Skip,
+                equivalentPcmContentAudioSources.contains(sourceRelativePath)
+                    ? QStringLiteral("equivalent-pcm-runtime-audio") : QStringLiteral("identical-to-runtime-audio"),
+                QString::fromUtf8("音频字节或已解码 PCM 格式及采样相同，保留源目录中的运行时副本及其元数据"));
+            continue;
+        }
+        QString extension = QFileInfo(filePath).suffix().toLower();
+        const std::optional<LegacyImageCategory> legacyImageCategory =
+            LegacyImageMigrationPolicy::classifyRelativePath(relativePath);
+        const bool topLevelImg = isTopLevelImgPath(relativePath);
+        const bool normalizeRuntimeJpeg = isRuntimeEntryJpeg(relativePath);
+
+        if (!options.includePrefix.isEmpty() &&
+            !relativePathMatchesPrefix(relativePath, options.includePrefix))
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                QStringLiteral(
+                    "include-prefix-not-selected"),
+                QString::fromUtf8(
+                    "文件不在本次图片子集前缀内"));
+            continue;
+        }
+
+        if (imageSubsetMigration && publishedImagePrefix.isEmpty())
+        {
+            publishedImagePrefix = normalizePath(mapOutputRelativePath(
+                matchedCasePreservingPrefix(relativePath, options.includePrefix)));
+        }
+
+        report.processedFiles++;
+        AssetResourceDomainReport& resourceDomainReport =
+            domainReportFor(report, resourceType);
+        resourceDomainReport.processedFiles++;
+        const int previousWrittenFiles = report.writtenFiles;
+        bool ok = false;
+        QString processingError;
+        AssetMigrationFileAction successfulAction =
+            AssetMigrationFileAction::Copy;
+        QString successReason =
+            QStringLiteral("raw-byte-copy");
+        if (isLegacyXnbSound(relativePath))
+        {
+            successfulAction = AssetMigrationFileAction::Convert;
+            successReason = QStringLiteral("xnb-pcm-sound-to-wav");
+            QByteArray wav;
+            if (decodeLegacyXnbSound(filePath, wav, processingError) && ensureParentDirectory(outputPath))
+            {
+                QSaveFile output(outputPath);
+                output.setDirectWriteFallback(false);
+                ok = output.open(QIODevice::WriteOnly) && output.write(wav) == wav.size() && output.commit();
+                if (ok)
+                    report.writtenFiles++;
+            }
+        }
+        else if (normalizeRuntimeJpeg)
+        {
+            successfulAction = AssetMigrationFileAction::Convert;
+            successReason = QStringLiteral("runtime-entry-jpeg-normalized");
+            ok = processRuntimeJpegFile(
+                filePath, outputPath, relativePath, report);
+        }
+        else if (legacyImageCategory.has_value())
+        {
+            const LegacyImageCategoryDefinition& definition =
+                LegacyImageMigrationPolicy::definition(
+                    *legacyImageCategory);
+            const LegacyImageMode mode =
+                effectiveOptions.legacyImages.mode(
+                    *legacyImageCategory);
+            if (!definition.entersOutput)
+            {
+                successfulAction =
+                    AssetMigrationFileAction::Skip;
+                successReason =
+                    QStringLiteral("legacy-image-policy-excluded");
+            }
+            else if (mode == LegacyImageMode::Convert &&
+                     isConvertibleLegacyImageExtension(
+                         extension))
+            {
+                successfulAction =
+                    AssetMigrationFileAction::Convert;
+                successReason =
+                    QStringLiteral("legacy-image-converted");
+            }
+            else
+            {
+                successReason =
+                    QStringLiteral("legacy-image-preserved");
+            }
+            ok = processImageFile(filePath, outputPath, relativePath,
+                *legacyImageCategory, effectiveOptions, report);
+        }
+        else if (topLevelImg)
+        {
+            ok = processRawCopyFile(filePath, outputPath, report);
+            if (ok)
+                report.preservedImages++;
+        }
+        else if (isTextExtension(extension) &&
+                 isRuntimeTextPath(relativePath))
+        {
+            successfulAction =
+                AssetMigrationFileAction::Convert;
+            successReason =
+                QStringLiteral("text-normalized-to-utf8");
+            ok = processTextFile(filePath, outputPath, relativePath, effectiveOptions, report);
+        }
+        else if ((extension == "map" || extension == "tmx") &&
+                 isRuntimeMapPath(relativePath))
+        {
+            successfulAction =
+                AssetMigrationFileAction::Convert;
+            successReason =
+                QStringLiteral("map-converted");
+            ok = processMapFile(filePath, outputPath, relativePath, effectiveOptions, report,
+                sourceDirObj.path(), outputRoot);
+        }
+        else if (isRawImageExtension(extension))
+        {
+            ok = processRawCopyFile(filePath, outputPath, report);
+            if (ok)
+                report.preservedImages++;
+        }
+        else
+        {
+            ok = processRawCopyFile(filePath, outputPath, report);
+        }
+        addDomainWrittenFiles(report, resourceType, previousWrittenFiles);
+
+        if (!ok)
+        {
+            resourceDomainReport.failedFiles++;
+            if (legacyImageCategory.has_value() || topLevelImg ||
+                isRawImageExtension(extension))
+            {
+                report.failedImages++;
+            }
+            report.errorCount++;
+            appendReportLog(report, logCallback, QString::fromUtf8("错误: 转换失败 %1").arg(relativePath));
+            if (!processingError.isEmpty())
+                appendReportLog(report, logCallback, processingError);
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral("processing-failed"),
+                processingError.isEmpty() ? QString::fromUtf8(
+                    "文件读取、转换或写入失败") : processingError);
+        }
+        else if (report.writtenFiles ==
+                 previousWrittenFiles)
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                QString(),
+                resourceType,
+                AssetMigrationFileAction::Skip,
+                successfulAction ==
+                        AssetMigrationFileAction::Skip
+                    ? successReason
+                    : QStringLiteral(
+                          "processor-produced-no-runtime-output"),
+                QString::fromUtf8(
+                    "文件已检查，但未产生运行时输出"));
+        }
+        else
+        {
+            appendFileOutcome(
+                report,
+                sourceRelativePath,
+                outputRelativePath,
+                resourceType,
+                successfulAction,
+                successReason);
+        }
+    }
+
+    // If cancelled, skip all post-processing steps that modify the output directory.
+    // Only write the report so the user can see what was completed before cancellation.
+    bool cancelled = report.cancelled ||
+        (cancelCallback && cancelCallback());
+    if (cancelled)
+    {
+        appendReportLog(report, logCallback, QString::fromUtf8("转换已取消，跳过后续转换/验证步骤。"));
+        return preserveFailedStaging(true);
+    }
+
+    for (AssetResourceType resourceType : resourceTypes)
+    {
+        if (resourceType == AssetResourceType::All ||
+            domainReportFor(report, resourceType).processedFiles > 0 ||
+            directoryMatchedDomains.contains(
+                assetResourceTypeId(
+                    resourceType)))
+        {
+            continue;
+        }
+
+        report.errorCount++;
+        if (imageSubsetMigration)
+        {
+            appendReportLog(report, logCallback,
+                QString::fromUtf8("错误: 图片子集未匹配任何运行时资源: %1")
+                    .arg(options.includePrefix));
+        }
+        else
+        {
+            appendReportLog(report, logCallback,
+                QString::fromUtf8("错误: 所选资源域未匹配任何运行时资源: %1")
+                    .arg(assetResourceTypeId(resourceType)));
+        }
+    }
+
+    const bool scriptsSelected = completeProject ||
+        resourceTypes.contains(AssetResourceType::Scripts);
+    if (scriptsSelected)
+    {
+        const int previousWrittenFiles = report.writtenFiles;
+        convertTalkDatToTalkIndex(outputRoot, outputRoot, effectiveOptions,
+            report, logCallback);
+        addDomainWrittenFiles(report, AssetResourceType::Scripts,
+            previousWrittenFiles);
+    }
+
+    if (completeProject)
+    {
+        const int previousWrittenFiles = report.writtenFiles;
+        migrateLegacyUiLayout(sourceRoot, outputRoot, uiBaseRoot, effectiveOptions, report);
+        ensureChooseMenuDefinition(
+            outputRoot,
+            uiBaseRoot,
+            report);
+        addDomainWrittenFiles(report, AssetResourceType::Other,
+            previousWrittenFiles);
+    }
+
+    if (options.convertScript && scriptsSelected)
+    {
+        appendReportLog(report, logCallback, QString::fromUtf8("开始检查转换后脚本语法"));
+        LuaScriptSyntaxReport syntaxReport = LuaScriptSyntaxValidator::validateAssetsScripts(
+            outputRoot,
+            LuaScriptSyntaxValidator::ProgressCallback(),
+            cancelCallback);
+        report.scriptSyntaxTotalFiles = syntaxReport.totalFiles;
+        report.scriptSyntaxCheckedFiles = syntaxReport.checkedFiles;
+        report.scriptSyntaxSkippedFiles = syntaxReport.skippedFiles;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("脚本语法检查完成: 检查 %1 个，跳过 %2 个，错误 %3 个")
+                .arg(syntaxReport.checkedFiles)
+                .arg(syntaxReport.skippedFiles)
+                .arg(syntaxReport.failedFiles));
+
+        if (syntaxReport.scriptRootMissing)
+        {
+            report.warningCount++;
+            appendReportLog(report, logCallback, QString::fromUtf8("警告: 输出目录缺少 script 子目录，跳过脚本语法检查"));
+        }
+        if (syntaxReport.cancelled)
+        {
+            appendReportLog(report, logCallback, QString::fromUtf8("脚本语法检查已取消。"));
+            return preserveFailedStaging(true);
+        }
+
+        for (const LuaScriptSyntaxIssue& issue : syntaxReport.issues)
+        {
+            QString item = issue.toString();
+            report.scriptSyntaxErrors.append(item);
+            QString sourceRelativePath;
+            QString quarantineRelativePath;
+            const QString outputRelativePath =
+                normalizePath(
+                    QDir(outputRoot).relativeFilePath(
+                        issue.filePath));
+            AssetMigrationFileOutcome* outcome =
+                sourceOutcomeForOutput(
+                    report,
+                    outputRelativePath);
+
+            if (issue.ioFailure)
+            {
+                report.errorCount++;
+                domainReportFor(
+                    report,
+                    AssetResourceType::Scripts).
+                        failedFiles++;
+                if (outcome)
+                {
+                    outcome->action =
+                        AssetMigrationFileAction::Fail;
+                    outcome->reason =
+                        QStringLiteral(
+                            "script-validation-io-failed");
+                    outcome->message = item;
+                }
+                appendReportLog(
+                    report,
+                    logCallback,
+                    QString::fromUtf8(
+                        "错误: 脚本验证读取失败 %1")
+                        .arg(item));
+                continue;
+            }
+
+            if (!quarantineUnavailableScript(
+                    outputRoot,
+                    finalOutputRoot,
+                    scannedSourcePathIsDirectory,
+                    previousManagedOutputs,
+                    issue.filePath,
+                    sourceRelativePath,
+                    quarantineRelativePath))
+            {
+                report.errorCount++;
+                domainReportFor(
+                    report,
+                    AssetResourceType::Scripts).
+                        failedFiles++;
+                if (outcome)
+                {
+                    outcome->action =
+                        AssetMigrationFileAction::Fail;
+                    outcome->reason =
+                        QStringLiteral(
+                            "script-quarantine-failed");
+                    outcome->message = item;
+                }
+                appendReportLog(
+                    report,
+                    logCallback,
+                    QString::fromUtf8(
+                        "错误: 无法隔离语法错误脚本 %1")
+                        .arg(item));
+                continue;
+            }
+
+            report.warningCount++;
+            report.unavailableScripts.append(
+                sourceRelativePath);
+            if (outcome)
+            {
+                outcome->action =
+                    AssetMigrationFileAction::Skip;
+                outcome->outputPath =
+                    quarantineRelativePath;
+                outcome->reason =
+                    QStringLiteral(
+                        "lua-syntax-error-quarantined");
+                outcome->message = item;
+            }
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "警告: Lua 语法错误，仅隔离对应脚本 %1；"
+                    "其他有效资源仍可发布。")
+                    .arg(item));
+        }
+    }
+
+    if (effectiveOptions.writeModProfile && completeProject)
+    {
+        const int previousWrittenFiles = report.writtenFiles;
+        const QString stagedProfilePath =
+            appendPath(
+                outputRoot,
+                QStringLiteral(
+                    "game_profile.ini"));
+        const bool profileWritten =
+            (!sourceProvidesModProfile ||
+             QFileInfo(stagedProfilePath).
+                 isFile()) &&
+            writeModProfileFile(
+                outputRoot,
+                effectiveOptions,
+                report);
+        if (!profileWritten)
+        {
+            if (sourceProvidesModProfile)
+            {
+                AssetMigrationFileOutcome*
+                    outcome =
+                        sourceOutcomeForOutput(
+                            report,
+                            QStringLiteral(
+                                "game_profile.ini"));
+                const bool wasCountedAsWritten =
+                    outcome &&
+                    (outcome->action ==
+                         AssetMigrationFileAction::
+                             Copy ||
+                     outcome->action ==
+                         AssetMigrationFileAction::
+                             Convert);
+                const bool wasAlreadyFailed =
+                    outcome &&
+                    outcome->action ==
+                        AssetMigrationFileAction::
+                            Fail;
+                if (wasCountedAsWritten)
+                {
+                    if (report.writtenFiles > 0)
+                        report.writtenFiles--;
+                    AssetResourceDomainReport&
+                        otherDomain =
+                            domainReportFor(
+                                report,
+                                AssetResourceType::
+                                    Other);
+                    if (otherDomain.writtenFiles >
+                        0)
+                    {
+                        otherDomain.
+                            writtenFiles--;
+                    }
+                }
+                if (outcome)
+                {
+                    outcome->action =
+                        AssetMigrationFileAction::
+                            Fail;
+                    outcome->reason =
+                        QStringLiteral(
+                            "source-mod-profile-merge-failed");
+                    outcome->message =
+                        QString::fromUtf8(
+                            "无法在保留源清单未知内容的同时"
+                            "合并转换选项");
+                }
+                if (!wasAlreadyFailed)
+                {
+                    report.errorCount++;
+                    domainReportFor(
+                        report,
+                        AssetResourceType::Other).
+                        failedFiles++;
+                }
+            }
+            else
+            {
+                report.errorCount++;
+                domainReportFor(
+                    report,
+                    AssetResourceType::Other).
+                        failedFiles++;
+            }
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 无法合并或写入 game_profile.ini。"));
+        }
+        else if (sourceProvidesModProfile)
+        {
+            // The source copy was already counted during the scan. Profile
+            // composition replaces that staged file but does not represent a
+            // second published file.
+            report.writtenFiles =
+                previousWrittenFiles;
+            AssetMigrationFileOutcome* outcome =
+                sourceOutcomeForOutput(
+                    report,
+                    QStringLiteral(
+                        "game_profile.ini"));
+            if (outcome &&
+                outcome->action !=
+                    AssetMigrationFileAction::Fail)
+            {
+                outcome->reason =
+                    QStringLiteral(
+                        "source-mod-profile-merged");
+                outcome->message =
+                    QString::fromUtf8(
+                        "源目录已提供 game_profile.ini；"
+                        "保留未知内容并用转换选项更新规范字段");
+            }
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "源目录已提供 game_profile.ini，"
+                    "已保留未知内容并合并转换选项中的规范字段。"));
+        }
+        addDomainWrittenFiles(report, AssetResourceType::Other,
+            previousWrittenFiles);
+    }
+
+    QSet<QString> dependencyDuplicateOmissions;
+    const QString stagedProfilePath =
+        appendPath(
+            outputRoot,
+            QStringLiteral("game_profile.ini"));
+    if (report.errorCount == 0 &&
+        QFileInfo(stagedProfilePath).isFile())
+    {
+        MigrationFallbackRoots fallbackRoots;
+        QString fallbackError;
+        if (!resolveMigrationFallbackRoots(
+                outputParent,
+                outputRoot,
+                fallbackRoots,
+                fallbackError))
+        {
+            report.errorCount++;
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 无法解析基底资源查重顺序: %1")
+                    .arg(fallbackError));
+        }
+        else
+        {
+            QStringList rootsToLock =
+                fallbackRoots.content;
+            for (const QString& root : fallbackRoots.ui)
+            {
+                if (!rootsToLock.contains(
+                        root,
+                        fileSystemPathCaseSensitivity()))
+                {
+                    rootsToLock.append(root);
+                }
+            }
+            bool locked = true;
+            for (const QString& root : rootsToLock)
+            {
+                if (!mutationLease.addResourcePath(root))
+                {
+                    locked = false;
+                    break;
+                }
+            }
+            if (!locked)
+            {
+                report.errorCount++;
+                appendReportLog(
+                    report,
+                    logCallback,
+                    QString::fromUtf8(
+                        "错误: 基底资源正在更新，无法取得一致的查重快照。"));
+            }
+            else
+            {
+                MigrationFallbackRoots lockedFallbackRoots;
+                QString lockedFallbackError;
+                if (!resolveMigrationFallbackRoots(
+                        outputParent,
+                        outputRoot,
+                        lockedFallbackRoots,
+                        lockedFallbackError) ||
+                    lockedFallbackRoots.content !=
+                        fallbackRoots.content ||
+                    lockedFallbackRoots.ui !=
+                        fallbackRoots.ui)
+                {
+                    report.errorCount++;
+                    appendReportLog(
+                        report,
+                        logCallback,
+                        QString::fromUtf8(
+                            "错误: 基底依赖链在查重前发生变化，请重新执行转换。"));
+                }
+                else
+                {
+                    QString deduplicationError;
+                    if (!removeExactDependencyDuplicates(
+                            outputRoot,
+                            lockedFallbackRoots,
+                            dependencyDuplicateOmissions,
+                            report,
+                            logCallback,
+                            deduplicationError))
+                    {
+                        report.errorCount++;
+                        appendReportLog(
+                            report,
+                            logCallback,
+                            QString::fromUtf8(
+                                "错误: 基底资源查重失败: %1")
+                                .arg(deduplicationError));
+                    }
+                }
+            }
+        }
+    }
+
+    QStringList publishedPaths;
+    if (!completeProject)
+    {
+        publishedPaths =
+            publishedPathsForResourceTypes(resourceTypes);
+        if (imageSubsetMigration)
+        {
+            QString imageOutputPrefix =
+                publishedImagePrefix;
+            while (imageOutputPrefix.startsWith('/'))
+                imageOutputPrefix.remove(0, 1);
+            while (imageOutputPrefix.endsWith('/'))
+                imageOutputPrefix.chop(1);
+            publishedPaths = {imageOutputPrefix};
+        }
+        if (resourceTypes.contains(
+                AssetResourceType::Scripts))
+        {
+            QSet<QString> quarantineRoots;
+            const auto addQuarantineRoot =
+                [&](const QString& relativePath)
+            {
+                const QString root =
+                    normalizedRelativePath(
+                        relativePath).
+                        section(
+                            QLatin1Char('/'),
+                            0,
+                            0);
+                if (root ==
+                        QStringLiteral(
+                            ".jxqy_migration_unavailable") ||
+                    root.startsWith(
+                        QStringLiteral(
+                            ".jxqy_migration_unavailable-")))
+                {
+                    quarantineRoots.insert(root);
+                }
+            };
+            for (const AssetMigrationFileOutcome&
+                     outcome :
+                 report.fileOutcomes)
+            {
+                if (outcome.reason ==
+                    QStringLiteral(
+                        "lua-syntax-error-quarantined"))
+                {
+                    addQuarantineRoot(
+                        outcome.outputPath);
+                }
+            }
+            for (const ManagedOutputDigest& digest :
+                 previousManagedOutputs)
+            {
+                addQuarantineRoot(
+                    digest.relativePath);
+            }
+            QStringList orderedQuarantineRoots =
+                quarantineRoots.values();
+            orderedQuarantineRoots.sort(
+                Qt::CaseSensitive);
+            publishedPaths.append(
+                orderedQuarantineRoots);
+        }
+        QStringList uniquePublishedPaths;
+        QSet<QString> publishedPathKeys;
+        for (const QString& publishedPath :
+             publishedPaths)
+        {
+            const QString pathKey =
+                lowerPathKey(
+                    publishedPath);
+            if (publishedPathKeys.contains(
+                    pathKey))
+            {
+                continue;
+            }
+            publishedPathKeys.insert(pathKey);
+            uniquePublishedPaths.append(
+                publishedPath);
+        }
+        publishedPaths =
+            uniquePublishedPaths;
+    }
+    QStringList transactionPaths = publishedPaths;
+    if (!completeProject)
+    {
+        transactionPaths
+            << QStringLiteral("migration_report.txt")
+            << QStringLiteral("migration_report.json")
+            << QString::fromLatin1(
+                   kMigrationMarkerFileName);
+    }
+
+    ManagedOutputDigestMap currentManagedOutputs;
+    ManagedOutputDigestMap combinedManagedOutputs =
+        previousManagedOutputs;
+    ExistingOutputSnapshot existingSnapshot;
+    QString snapshotErrorPath;
+    QString snapshotError;
+    if (report.errorCount == 0)
+    {
+        if (!collectExistingOutputSnapshot(
+                finalOutputRoot,
+                completeProject
+                    ? QStringList()
+                    : transactionPaths,
+                existingSnapshot,
+                snapshotErrorPath,
+                snapshotError))
+        {
+            report.errorCount++;
+            appendFileOutcome(
+                report,
+                snapshotErrorPath.isEmpty()
+                    ? QStringLiteral(".")
+                    : snapshotErrorPath,
+                snapshotErrorPath,
+                snapshotErrorPath.isEmpty()
+                    ? AssetResourceType::Other
+                    : resourceTypeForRelativePath(
+                          snapshotErrorPath),
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-output-snapshot-failed"),
+                snapshotError,
+                false);
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 无法建立旧输出发布快照，取消发布: %1")
+                    .arg(snapshotError));
+        }
+        else if (!collectManagedOutputDigests(
+                outputRoot,
+                currentManagedOutputs))
+        {
+            report.errorCount++;
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 无法为本次受管输出生成完整 SHA-256 清单，取消发布。"));
+        }
+        else
+        {
+            combinedManagedOutputs =
+                mergeManagedOutputDigests(
+                    previousManagedOutputs,
+                    currentManagedOutputs,
+                    dependencyDuplicateOmissions);
+            applyManagedOutputDigestsToReport(
+                report,
+                currentManagedOutputs,
+                combinedManagedOutputs);
+        }
+    }
+
+    // Build a complete publish candidate before the root swap. Files from an
+    // earlier output generation that this staging generation does not own are
+    // copied forward byte-for-byte. Any path-shape/case conflict blocks the
+    // transaction, leaving the prior output untouched.
+    if (report.errorCount == 0)
+    {
+        mergeExistingOutputFiles(
+            finalOutputRoot,
+            outputRoot,
+            existingSnapshot,
+            previousManagedOutputs,
+            currentManagedOutputs,
+            dependencyDuplicateOmissions,
+            completeProject
+                ? QStringList()
+                : publishedPaths,
+            report,
+            logCallback);
+    }
+    if (report.errorCount == 0 &&
+        !writeMigrationMarkerFile(
+            outputRoot,
+            combinedManagedOutputs))
+    {
+        report.errorCount++;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "错误: 无法写入带 SHA-256 provenance 的转换输出标记，取消发布。"));
+    }
+
+    // Determine final status before writing report
+    MigrationResult result = MigrationResult::Success;
+    if (report.errorCount > 0)
+    {
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("转换失败: %1 个错误").arg(report.errorCount));
+        result = MigrationResult::Failed;
+    }
+    else if (report.warningCount > 0)
+    {
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("转换完成但存在警告: %1 个").arg(report.warningCount));
+        result = MigrationResult::Partial;
+    }
+    else
+    {
+        appendReportLog(report, logCallback, QString::fromUtf8("转换流程完成，未记录处理错误"));
+    }
+
+    if (result == MigrationResult::Failed)
+        return preserveFailedStaging(false);
+
+    // Reports are part of the staged artifact. A report write failure prevents
+    // publication just like any other output failure.
+    bool textReportWritten = writeReportFile(outputRoot, report);
+    bool jsonReportWritten = writeReportJsonFile(outputRoot, report, result);
+    if (!textReportWritten || !jsonReportWritten)
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: 无法完整写入转换报告，取消发布新输出。"));
+        return preserveFailedStaging(false);
+    }
+
+    QString retainedBackupPath;
+    QString publishError;
+    QString changedRelativePath;
+    bool published = false;
+    if (completeProject)
+    {
+        published = publishStagedRoot(
+            outputRoot,
+            finalOutputRoot,
+            existingSnapshot,
+            retainedBackupPath,
+            publishError,
+            changedRelativePath);
+    }
+    else
+    {
+        published = publishStagedEntries(
+            outputRoot,
+            finalOutputRoot,
+            transactionPaths,
+            existingSnapshot,
+            retainedBackupPath,
+            publishError,
+            changedRelativePath);
+    }
+
+    if (!published)
+    {
+        report.errorCount++;
+        if (!changedRelativePath.isEmpty())
+        {
+            appendFileOutcome(
+                report,
+                changedRelativePath,
+                changedRelativePath,
+                changedRelativePath ==
+                        QStringLiteral(".")
+                    ? AssetResourceType::Other
+                    : resourceTypeForRelativePath(
+                          changedRelativePath),
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "existing-output-changed-before-publish"),
+                QString::fromUtf8(
+                    "旧输出在合并完成后、发布前发生变化"),
+                false);
+        }
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("错误: %1").arg(publishError));
+        return preserveFailedStaging(false);
+    }
+
+    stagingDirectory->setAutoRemove(false);
+    report.reportFilePath = appendPath(finalOutputRoot, "migration_report.txt");
+    report.reportJsonFilePath = appendPath(finalOutputRoot, "migration_report.json");
+
+    if (!retainedBackupPath.isEmpty())
+    {
+        report.warningCount++;
+        result = MigrationResult::Partial;
+        const QString retainedBackupWarning =
+            publishError.isEmpty()
+            ? QString::fromUtf8(
+                  "新输出已发布，但旧输出备份清理失败")
+            : publishError;
+        report.publishWarning =
+            retainedBackupWarning;
+        report.retainedBackupPath =
+            retainedBackupPath;
+        appendReportLog(
+            report,
+            logCallback,
+            QString::fromUtf8(
+                "警告: %1；备份保留在: %2")
+                .arg(
+                    retainedBackupWarning,
+                    retainedBackupPath));
+        const bool partialTextReportWritten =
+            writeReportFile(
+                finalOutputRoot,
+                report);
+        const bool partialJsonReportWritten =
+            writeReportJsonFile(
+                finalOutputRoot,
+                report,
+                result);
+        if (!partialTextReportWritten ||
+            !partialJsonReportWritten)
+        {
+            report.errorCount++;
+            result =
+                MigrationResult::Failed;
+            appendReportLog(
+                report,
+                logCallback,
+                QString::fromUtf8(
+                    "错误: 新输出已经发布且旧输出备份仍保留，"
+                    "但最终 Partial 报告重写失败；"
+                    "不能把磁盘中的旧报告状态视为可信。"));
+
+            // Retry once with the terminal Failed status. A persistent write
+            // failure clears the corresponding report path, so callers never
+            // receive a non-empty path to a stale Success/Partial report.
+            const bool failedTextReportWritten =
+                writeReportFile(
+                    finalOutputRoot,
+                    report);
+            const bool failedJsonReportWritten =
+                writeReportJsonFile(
+                    finalOutputRoot,
+                    report,
+                    result);
+            if (!failedTextReportWritten)
+                report.reportFilePath.clear();
+            if (!failedJsonReportWritten)
+                report.reportJsonFilePath.clear();
+        }
+    }
+
+    appendReportLog(report, logCallback,
+        QString::fromUtf8("转换报告: %1").arg(report.reportFilePath));
+    return result;
+}
+
+QString JxAssetMigrator::normalizePath(QString path) const
+{
+    path.replace("\\", "/");
+    while (path.startsWith("./"))
+        path = path.mid(2);
+    while (path.contains("//"))
+        path.replace("//", "/");
+    return path;
+}
+
+QString JxAssetMigrator::mapOutputRelativePath(const QString& relativePath) const
+{
+    QString normalized = normalizePath(relativePath);
+    QStringList parts = normalized.split("/", Qt::SkipEmptyParts);
+    if (parts.isEmpty())
+        return normalized;
+
+    if (isLegacyContentAudioPath(normalized))
+    {
+        parts.removeFirst();
+        if (isLegacyXnbSound(normalized))
+        {
+            parts.last().chop(4);
+            parts.last().append(".wav");
+        }
+    }
+
+    // Preserve original directory structure: do not remap asf/ to mpc/.
+    // The engine auto-detects image format from file headers, so both
+    // asf/ and mpc/ paths work at runtime regardless of directory name.
+    static const QSet<QString> canonicalRuntimeRootDirectories = {
+        "asf",
+        "font",
+        "img",
+        "ini",
+        "map",
+        "mpc",
+        "music",
+        "script",
+        "sound",
+        "video"
+    };
+    QString rootDirectory = parts[0].toLower();
+    if (canonicalRuntimeRootDirectories.contains(rootDirectory))
+        parts[0] = rootDirectory;
+
+    if (parts.size() == 1 &&
+        parts[0].compare(
+            QStringLiteral(
+                "game_profile.ini"),
+            Qt::CaseInsensitive) == 0)
+    {
+        parts[0] =
+            QStringLiteral(
+                "game_profile.ini");
+    }
+
+    if (parts.size() >= 3 &&
+        parts[0].compare("ini", Qt::CaseInsensitive) == 0 &&
+        parts[1].compare("ui", Qt::CaseInsensitive) == 0)
+    {
+        for (int i = 2; i < parts.size(); i++)
+            parts[i] = parts[i].toLower();
+    }
+
+    if (parts.size() >= 3 &&
+        parts[0].compare("script", Qt::CaseInsensitive) == 0 &&
+        parts[1].compare("common", Qt::CaseInsensitive) == 0 &&
+        parts.last().compare("newgame.txt", Qt::CaseInsensitive) == 0)
+    {
+        parts.last() = "newgame.txt";
+    }
+
+    QString outputPath = lowercaseAsciiPath(joinRelativePath(parts));
+    if (isRuntimeEntryJpeg(outputPath))
+        outputPath = replaceJpegExtensionWithPng(outputPath);
+    return outputPath;
+}
+
+bool JxAssetMigrator::copyFileReplacing(const QString& sourcePath, const QString& outputPath, AssetMigrationReport& report)
+{
+    if (!ensureParentDirectory(outputPath))
+        return false;
+
+    // Atomic replace via QSaveFile: data is written to a temp file and only
+    // swapped onto the target on a successful commit(). If the write or commit
+    // fails, the existing target file is left intact — the previous approach
+    // removed the target before renaming the temp file, which lost the old
+    // file when the rename failed.
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::ReadOnly))
+        return false;
+
+    QSaveFile output(outputPath);
+    output.setDirectWriteFallback(false);
+    if (!output.open(QIODevice::WriteOnly))
+        return false;
+
+    char buffer[65536];
+    qint64 bytesRead;
+    bool writeOk = true;
+    while ((bytesRead = source.read(buffer, sizeof(buffer))) > 0)
+    {
+        if (output.write(buffer, bytesRead) != bytesRead)
+        {
+            writeOk = false;
+            break;
+        }
+    }
+    if (bytesRead < 0)
+        writeOk = false;
+
+    source.close();
+
+    if (!writeOk)
+    {
+        output.cancelWriting();
+        return false;
+    }
+    if (!output.commit())
+        return false;
+
+    report.writtenFiles++;
+    return true;
+}
+
+bool JxAssetMigrator::writeTextFileUtf8(const QString& outputPath, const std::string& content, bool withBom, AssetMigrationReport& report)
+{
+    if (!ensureParentDirectory(outputPath))
+        return false;
+    if (!content.empty() &&
+        !Util::isUtf8(reinterpret_cast<const uint8_t*>(content.data()), content.size()))
+    {
+        return false;
+    }
+
+    QByteArray outData;
+    if (withBom)
+        outData.append("\xEF\xBB\xBF", 3);
+    outData.append(content.data(), static_cast<int>(content.size()));
+
+    // Use QSaveFile for reliable transactional write on all platforms.
+    // On Windows, QSaveFile uses ReplaceFile API which atomically replaces
+    // the target file, avoiding the issue where _wrename fails if target exists.
+    QSaveFile file(outputPath);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+
+    if (file.write(outData) != outData.size())
+    {
+        file.cancelWriting();
+        return false;
+    }
+
+    if (!file.commit())
+        return false;
+
+    report.writtenFiles++;
+    return true;
+}
+
+bool JxAssetMigrator::processTextFile(const QString& sourcePath, const QString& outputPath, const QString& relativePath,
+    const AssetMigrationOptions& options, AssetMigrationReport& report)
+{
+    std::vector<uint8_t> buffer = Util::readFileToBuffer(sourcePath.toUtf8().toStdString());
+    QString extension = QFileInfo(sourcePath).suffix().toLower();
+    const bool isScriptText = isConvertibleScriptText(relativePath, extension);
+    const bool isExecutableScriptText = isScriptText &&
+        !isLegacyScriptDocumentation(relativePath);
+    if (buffer.empty())
+    {
+        QFileInfo sourceInfo(sourcePath);
+        if (sourceInfo.exists() && sourceInfo.size() == 0)
+            return writeTextFileUtf8(outputPath, std::string(), !isExecutableScriptText, report);
+        return false;
+    }
+
+    std::string content(buffer.begin(), buffer.end());
+    std::string utf8Content;
+    if (!convertLegacyJxTextToUtf8(content, options.sourceEncoding, utf8Content))
+    {
+        report.warningCount++;
+        report.logLines.append(QString::fromUtf8("警告: 文本编码转换失败，跳过输出 %1").arg(relativePath));
+        return false;
+    }
+    content = utf8Content;
+
+    content = rewriteLegacyJxReferences(content, relativePath);
+
+    if (lowerPathKey(relativePath) == "ini/map/mapname.ini")
+        content = rewriteMapNameIniToIdentity(content);
+
+    if (lowerPathKey(relativePath).startsWith("ini/objres/") && extension == "ini")
+        content = normalizeObjectResourceIni(content, relativePath);
+
+    if (isExecutableScriptText && options.convertScript)
+    {
+        ScriptConverter converter;
+        content = converter.convertScript(content);
+        if (!isOrphanScriptText(relativePath))
+        {
+        for (const ScriptConversionDiagnostic& diagnostic : converter.getDiagnostics())
+        {
+            QString item = QString::fromUtf8("%1:%2 [%3] %4 | %5")
+                .arg(sourcePath)
+                .arg(diagnostic.lineNumber)
+                .arg(QString::fromUtf8(diagnostic.category.c_str()))
+                .arg(QString::fromUtf8(diagnostic.message.c_str()))
+                .arg(QString::fromUtf8(diagnostic.line.c_str()));
+            report.unhandledScriptStatements.append(item);
+            report.warningCount++;
+            report.logLines.append(QString::fromUtf8("警告: 脚本转换未处理语句 %1").arg(item));
+        }
+        }
+        if (!isOrphanScriptText(relativePath))
+            scanUnsupportedScriptApis(content, sourcePath, report);
+    }
+
+    if (isExecutableScriptText && options.replaceWavWithMp3)
+        content = replacePlayMusicWavWithMp3(content);
+
+    content = lowercaseTextResourceReferences(
+        content, extension, isExecutableScriptText);
+
+    const bool writeBom =
+        !isExecutableScriptText &&
+        lowerPathKey(relativePath) !=
+            QStringLiteral(
+                "game_profile.ini");
+    return writeTextFileUtf8(
+        outputPath,
+        content,
+        writeBom,
+        report);
+}
+
+bool JxAssetMigrator::processMapFile(const QString& sourcePath, const QString& outputPath, const QString& relativePath,
+    const AssetMigrationOptions& options, AssetMigrationReport& report,
+    const QString& sourceRoot, const QString& outputRoot)
+{
+    if (!ensureParentDirectory(outputPath))
+        return false;
+
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::ReadOnly))
+        return false;
+    QByteArray header = source.peek(MAP_EDITOR_HEADSTR_LEN);
+    source.close();
+    if (!header.startsWith("MAP File") && QFileInfo(sourcePath).suffix().compare("tmx", Qt::CaseInsensitive) == 0)
+    {
+        QStringList generatedFiles;
+        QStringList warnings;
+        QString error;
+        const bool converted = TiledMapConverter::convert(sourcePath, sourceRoot, outputRoot,
+            mapOutputRelativePath(relativePath), generatedFiles, warnings, error);
+        for (const QString& warning : warnings)
+        {
+            report.warningCount++;
+            report.logLines.append(QStringLiteral("Warning: %1: %2").arg(relativePath, warning));
+        }
+        if (!converted)
+        {
+            report.logLines.append(error);
+            return false;
+        }
+        for (const QString& generated : generatedFiles)
+        {
+            appendFileOutcome(report, relativePath, generated, AssetResourceType::Maps,
+                AssetMigrationFileAction::Convert, QStringLiteral("tmx-generated-image-package"),
+                QString(), false);
+        }
+        report.writtenFiles += 1 + generatedFiles.size();
+        report.convertedMaps++;
+        return true;
+    }
+    if (!header.startsWith("MAP File"))
+    {
+        report.warningCount++;
+        report.logLines.append(QStringLiteral("Warning: skipped non-MAP placeholder file %1").arg(relativePath));
+        return true;
+    }
+
+    MapConverter converter;
+    bool ok = converter.migrateFile(
+        sourcePath.toUtf8().toStdString(),
+        outputPath.toUtf8().toStdString(),
+        options.sourceEncoding.compare(
+            QStringLiteral("gbk"), Qt::CaseInsensitive) == 0);
+    if (ok)
+    {
+        report.writtenFiles++;
+        report.convertedMaps++;
+    }
+    else if (!converter.getLastMessage().empty())
+        report.logLines.append(QString::fromStdString(converter.getLastMessage()));
+    return ok;
+}
+
+bool JxAssetMigrator::processRawCopyFile(const QString& sourcePath, const QString& outputPath, AssetMigrationReport& report)
+{
+    return copyFileReplacing(sourcePath, outputPath, report);
+}
+
+bool JxAssetMigrator::processRuntimeJpegFile(const QString& sourcePath,
+    const QString& outputPath, const QString& relativePath,
+    AssetMigrationReport& report)
+{
+    QImage image(sourcePath);
+    if (image.isNull() || !ensureParentDirectory(outputPath))
+    {
+        appendReportLog(report, LogCallback(),
+            QString::fromUtf8("运行时入口 JPEG 转换失败: %1")
+                .arg(relativePath));
+        return false;
+    }
+
+    QSaveFile output(outputPath);
+    output.setDirectWriteFallback(false);
+    if (!output.open(QIODevice::WriteOnly) ||
+        !image.convertToFormat(QImage::Format_RGBA8888).save(&output, "PNG") ||
+        !output.commit())
+    {
+        output.cancelWriting();
+        appendReportLog(report, LogCallback(),
+            QString::fromUtf8("运行时入口 JPEG 写入 PNG 失败: %1")
+                .arg(relativePath));
+        return false;
+    }
+
+    report.writtenFiles++;
+    report.convertedWithoutCrop++;
+    return true;
+}
+
+bool JxAssetMigrator::processImageFile(const QString& sourcePath,
+    const QString& outputPath, const QString& relativePath,
+    LegacyImageCategory category, const AssetMigrationOptions& options,
+    AssetMigrationReport& report)
+{
+    const LegacyImageCategoryDefinition& categoryDefinition =
+        LegacyImageMigrationPolicy::definition(category);
+    if (!categoryDefinition.entersOutput)
+    {
+        report.skippedUnknownImages++;
+        appendReportLog(report, LogCallback(),
+            QString::fromUtf8("跳过 unknown 旧图片目录文件: %1")
+                .arg(relativePath));
+        return true;
+    }
+
+    QString extension = QFileInfo(sourcePath).suffix().toLower();
+    const LegacyImageMode mode = options.legacyImages.mode(category);
+    if (mode != LegacyImageMode::Convert ||
+        !isConvertibleLegacyImageExtension(extension))
+    {
+        const bool copied = copyFileReplacing(sourcePath, outputPath, report);
+        if (copied)
+        {
+            if (category == LegacyImageCategory::Map)
+                report.preservedMapImages++;
+            else
+                report.preservedImages++;
+        }
+        return copied;
+    }
+
+    if (!ensureParentDirectory(outputPath))
+        return false;
+
+    // Save legacy pictures as IMP/IMG content while keeping the original file
+    // extension so existing runtime resource references continue to resolve.
+    PicFileEditor editor;
+    if (!editor.loadFromFile(sourcePath.toUtf8().toStdString()))
+    {
+        appendReportLog(report, LogCallback(), QString::fromUtf8("图片加载失败: %1").arg(relativePath));
+        return false;
+    }
+
+    const bool cropped = options.legacyImages.shouldCrop(category);
+    if (cropped)
+        editor.cropTransparentEdgesAllFrames();
+
+    if (editor.saveAsIMP(outputPath.toUtf8().toStdString()))
+    {
+        report.writtenFiles++;
+        if (cropped)
+            report.convertedAndCropped++;
+        else
+            report.convertedWithoutCrop++;
+        return true;
+    }
+
+    appendReportLog(report, LogCallback(), QString::fromUtf8("图片转换IMP失败: %1").arg(relativePath));
+    return false;
+}
+
+std::string JxAssetMigrator::rewriteLegacyJxReferences(const std::string& content, const QString& relativePath) const
+{
+    QString text = QString::fromUtf8(content.data(), static_cast<int>(content.size()));
+    text.replace("content\\partneridx.ini", "partneridx.ini", Qt::CaseInsensitive);
+    text.replace("content/partneridx.ini", "partneridx.ini", Qt::CaseInsensitive);
+
+    const QString normalizedPath = lowerPathKey(relativePath);
+    const bool isTitleConfiguration =
+        normalizedPath.startsWith(QStringLiteral("ini/ui/title/"));
+    const bool isGameProfile =
+        normalizedPath == QStringLiteral("game_profile.ini");
+    if (isTitleConfiguration || isGameProfile)
+    {
+        const QString keys = isTitleConfiguration
+            ? QStringLiteral("Bitmap|Image")
+            : QStringLiteral("Cover");
+        const QRegularExpression jpegReference(
+            QStringLiteral(
+                "^(\\s*(?:%1)\\s*=\\s*[^\\r\\n]*?)\\.jpe?g(\\s*)$")
+                .arg(keys),
+            QRegularExpression::CaseInsensitiveOption |
+                QRegularExpression::MultilineOption);
+        text.replace(jpegReference, QStringLiteral("\\1.png\\2"));
+    }
+
+    return text.toUtf8().toStdString();
+}
+
+std::string JxAssetMigrator::rewriteMapNameIniToIdentity(const std::string& content) const
+{
+    QString text = QString::fromUtf8(content.data(), static_cast<int>(content.size()));
+    QStringList lines = text.split('\n');
+    bool inInitSection = false;
+
+    for (QString& line : lines)
+    {
+        QString trimmed = line.trimmed();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']'))
+        {
+            inInitSection = trimmed.mid(1, trimmed.size() - 2).compare("Init", Qt::CaseInsensitive) == 0;
+            continue;
+        }
+
+        if (!inInitSection || trimmed.startsWith(';') || trimmed.startsWith('#'))
+            continue;
+
+        int equalsPos = line.indexOf('=');
+        if (equalsPos <= 0)
+            continue;
+
+        QString prefix = line.left(equalsPos + 1);
+        QString key = line.left(equalsPos).trimmed();
+        if (!key.isEmpty())
+            line = prefix + key;
+    }
+
+    return lines.join('\n').toUtf8().toStdString();
+}
+
+std::string JxAssetMigrator::normalizeObjectResourceIni(const std::string& content, const QString& relativePath) const
+{
+    QString text = QString::fromUtf8(content.data(), static_cast<int>(content.size()));
+    QStringList lines = text.split('\n');
+
+    if (lowerPathKey(relativePath).endsWith("/obj-sound.ini"))
+    {
+        for (QString& line : lines)
+        {
+            QString trimmed = line.trimmed();
+            if (trimmed.startsWith("Image=", Qt::CaseInsensitive))
+            {
+                QString prefix = line.left(line.indexOf('=') + 1);
+                line = prefix;
+            }
+        }
+        text = lines.join('\n');
+        lines = text.split('\n');
+    }
+
+    bool hasCommonSection = false;
+    for (const QString& line : lines)
+    {
+        QString trimmed = line.trimmed();
+        if (trimmed.compare("[Common]", Qt::CaseInsensitive) == 0)
+        {
+            hasCommonSection = true;
+            break;
+        }
+    }
+    if (hasCommonSection)
+        return text.toUtf8().toStdString();
+
+    QStringList commonLines;
+    bool inSection = false;
+    bool chosenSection = false;
+    QStringList currentSectionLines;
+    bool currentSectionHasResource = false;
+    int chosenSectionStartLine = -1;  // first content line index of chosen section
+    int chosenSectionEndLine = -1;    // one past last content line index
+    int sectionContentStartLine = -1;
+
+    auto flushSection = [&](int sectionContentStart, int currentLineIndex) {
+        if (!chosenSection && currentSectionHasResource)
+        {
+            // Only the resource keys (Image/Shade/Sound/Animation) move into [Common];
+            // comments, blank lines and other config stay in the original
+            // section so runtime semantics are not duplicated.
+            for (const QString& l : currentSectionLines)
+            {
+                QString t = l.trimmed();
+                if (t.startsWith("Image=", Qt::CaseInsensitive) ||
+                    t.startsWith("Shade=", Qt::CaseInsensitive) ||
+                    t.startsWith("Sound=", Qt::CaseInsensitive) ||
+                    t.startsWith("Animation=", Qt::CaseInsensitive))
+                {
+                    commonLines.append(l);
+                }
+            }
+            chosenSection = true;
+            chosenSectionStartLine = sectionContentStart;
+            chosenSectionEndLine = currentLineIndex;
+        }
+        currentSectionLines.clear();
+        currentSectionHasResource = false;
+    };
+
+    for (int i = 0; i < lines.size(); i++)
+    {
+        QString line = lines[i];
+        QString trimmed = line.trimmed();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']'))
+        {
+            if (inSection)
+                flushSection(sectionContentStartLine, i);
+            inSection = true;
+            sectionContentStartLine = i + 1;
+            continue;
+        }
+
+        if (!inSection || chosenSection)
+            continue;
+
+        currentSectionLines.append(line);
+        if (trimmed.startsWith("Image=", Qt::CaseInsensitive) ||
+            trimmed.startsWith("Shade=", Qt::CaseInsensitive) ||
+            trimmed.startsWith("Sound=", Qt::CaseInsensitive) ||
+            trimmed.startsWith("Animation=", Qt::CaseInsensitive))
+        {
+            currentSectionHasResource = true;
+        }
+    }
+    if (inSection)
+        flushSection(sectionContentStartLine, lines.size());
+
+    if (commonLines.isEmpty())
+        return text.toUtf8().toStdString();
+
+    QStringList output;
+    output.append("[Common]");
+    output.append(commonLines);
+    output.append("");
+    for (int i = 0; i < lines.size(); i++)
+    {
+        // Skip resource key lines from the chosen section (they're now in [Common])
+        if (i >= chosenSectionStartLine && i < chosenSectionEndLine)
+        {
+            QString trimmed = lines[i].trimmed();
+            if (trimmed.startsWith("Image=", Qt::CaseInsensitive) ||
+                trimmed.startsWith("Shade=", Qt::CaseInsensitive) ||
+                trimmed.startsWith("Sound=", Qt::CaseInsensitive) ||
+                trimmed.startsWith("Animation=", Qt::CaseInsensitive))
+            {
+                continue;
+            }
+        }
+        output.append(lines[i]);
+    }
+    return output.join('\n').toUtf8().toStdString();
+}
+
+std::string JxAssetMigrator::replacePlayMusicWavWithMp3(const std::string& content) const
+{
+    std::istringstream stream(content);
+    std::string result;
+    std::string line;
+
+    while (std::getline(stream, line))
+    {
+        std::string lower = line;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (lower.find("playmusic") != std::string::npos)
+        {
+            size_t pos = 0;
+            while ((pos = lower.find(".wav", pos)) != std::string::npos)
+            {
+                line.replace(pos, 4, ".mp3");
+                lower.replace(pos, 4, ".mp3");
+                pos += 4;
+            }
+        }
+        result += line + "\n";
+    }
+
+    return result;
+}
+
+void JxAssetMigrator::migrateLegacyUiLayout(
+    const QString& sourceDir, const QString& outputDir, const QString& uiBaseRoot,
+    const AssetMigrationOptions& options, AssetMigrationReport& report)
+{
+    // The C# edition reads UI_Settings.ini, not the bundled 640x480 window INIs.
+    // Migrate texture sizes and HUD offsets, retaining the C++ UI family's
+    // viewport anchors rather than copying the unused fixed coordinates.
+    QString settingsPath;
+    QDirIterator files(sourceDir, QDir::Files, QDirIterator::Subdirectories);
+    while (files.hasNext())
+    {
+        const QString path = files.next();
+        if (lowerPathKey(QDir(sourceDir).relativeFilePath(path)) ==
+            "content/ui/ui_settings.ini")
+        {
+            settingsPath = path;
+            break;
+        }
+    }
+    INIFileEditor settings;
+    if (!settingsPath.isEmpty())
+    {
+        const auto bytes = Util::readFileToBuffer(settingsPath.toUtf8().toStdString());
+        std::string decoded;
+        if (!convertLegacyJxTextToUtf8(std::string(bytes.begin(), bytes.end()),
+                options.sourceEncoding, decoded) || !settings.loadFromString(decoded))
+        {
+            report.errorCount++;
+            report.logLines.append(QString::fromUtf8("错误: 无法读取 C# UI 布局配置 %1").arg(settingsPath));
+            return;
+        }
+    }
+    struct WindowLayout
+    {
+        const char* directory;
+        const char* section;
+        const char* anchor;
+        int horizontalSide;
+    };
+    const WindowLayout layouts[] = {
+        {"equip", "Equip", "alLTCorner", -1},
+        {"state", "State", "alLTCorner", -1},
+        {"xiulian", "XiuLian", "alLTCorner", -1},
+        {"buysell", "BuySell", "alLTCorner", -1},
+        {"goods", "Goods", "alRTCorner", 1},
+        {"magic", "Magics", "alRTCorner", 1},
+        {"memo", "Memo", "alRTCorner", 1},
+        {"saveload", "SaveLoad", "alCenter", 0},
+        {"option", "", "alCenter", 0},
+        {"system", "System", "alCenter", 0},
+        {"littlemap", "LittleMap", "alCenter", 0},
+        {"tooltip", "ToolTip_Type1", "alTopCenter", 0},
+        {"yesno", "", "alCenter", 0},
+        {"dialog", "Dialog", "alBottomCenter", 0},
+        {"message", "Message", "alBottomCenter", 0},
+        {"bottom", "Bottom", "alBottomCenter", 0},
+        {"column", "BottomState", "alBottomCenter", 1},
+        {"top", "Top", "alTopCenter", 0},
+        {"timer", "Timer", "alRTCorner", 1}
+    };
+    for (const auto& layout : layouts)
+    {
+        if (settingsPath.isEmpty())
+            break;
+        const QString relativePath = QString("ini/ui/%1/window.ini").arg(layout.directory);
+        const QString outputPath = appendPath(outputDir, relativePath);
+        if (!QFileInfo(outputPath).isFile())
+            continue;
+        const auto windowBytes = Util::readFileToBuffer(outputPath.toUtf8().toStdString());
+        INIFileEditor window;
+        if (!window.loadFromString(std::string(windowBytes.begin(), windowBytes.end())))
+            continue;
+        if (window.hasKey("Init", "Align"))
+            continue;
+        int width = static_cast<int>(window.getInteger("Init", "Width", 0));
+        int height = static_cast<int>(window.getInteger("Init", "Height", 0));
+        // C# uses texture dimensions. In particular its practice and dialogue
+        // rectangles differ from the unused legacy window declarations.
+        QString image = QString::fromUtf8(settings.get(layout.section, "Image").c_str());
+        image.replace('\\', '/');
+        while (image.startsWith('/'))
+            image.remove(0, 1);
+        PicFileEditor picture;
+        if (!image.isEmpty() && isSafeRelativeSubdirectory(image) &&
+            picture.loadFromFile(appendPath(sourceDir, image).toUtf8().toStdString()))
+        {
+            const QImage frame = picture.getFrameImage(0);
+            if (!frame.isNull())
+            {
+                width = frame.width();
+                height = frame.height();
+            }
+        }
+        if (width <= 0 || height <= 0)
+            continue;
+        const int left = static_cast<int>(settings.getInteger(layout.section, "LeftAdjust", 0));
+        const int top = static_cast<int>(settings.getInteger(layout.section, "TopAdjust", 0));
+        const std::string anchor = layout.anchor;
+        int offsetX = left + layout.horizontalSide * (width / 2);
+        int offsetY = top;
+        if (anchor == "alLTCorner" || anchor == "alRTCorner")
+        {
+            offsetX = anchor == "alLTCorner" ? -30 : 30;
+            if (std::string(layout.directory) != "timer")
+                offsetX += left;
+        }
+        if (std::string(layout.directory) == "dialog")
+            offsetY += height; // C#: WindowHeight + TopAdjust.
+        // Native standalone windows and notices already define their intended
+        // centered/edge layout, including clearance above the quick bar.
+        const std::string directory = layout.directory;
+        if (directory == "system" || directory == "littlemap")
+            offsetY = 0;
+        INIFileEditor baseWindow;
+        if (!uiBaseRoot.isEmpty())
+            baseWindow.loadFromFile(appendPath(uiBaseRoot, relativePath).toUtf8().toStdString());
+        const bool inheritAnchor = baseWindow.hasKey("Init", "Align") &&
+            directory != "bottom" && directory != "column" &&
+            directory != "top" && directory != "dialog";
+        window.setInteger("Init", "Width", width);
+        window.setInteger("Init", "Height", height);
+        window.set("Init", "Align", inheritAnchor ? baseWindow.get("Init", "Align") : anchor);
+        window.setInteger("Init", "AlignX", inheritAnchor ? baseWindow.getInteger("Init", "AlignX", 0) : offsetX);
+        window.setInteger("Init", "AlignY", inheritAnchor ? baseWindow.getInteger("Init", "AlignY", 0) : offsetY);
+        const bool written = writeTextFileUtf8(outputPath, window.saveToString(), false, report);
+        appendFileOutcome(report, "content/ui/ui_settings.ini", relativePath,
+            AssetResourceType::Other,
+            written ? AssetMigrationFileAction::Convert : AssetMigrationFileAction::Fail,
+            written ? "legacy-ui-viewport-layout" : "legacy-ui-layout-write-failed",
+            QString::fromUtf8("将 C# UI 布局转换为窗口锚点"), false);
+        if (!written)
+        {
+            report.errorCount++;
+            domainReportFor(report, AssetResourceType::Other).failedFiles++;
+        }
+    }
+    if (settings.hasSection("NpcInfoShow"))
+    {
+        const int width = static_cast<int>(settings.getInteger("NpcInfoShow", "Width", 0));
+        const int height = static_cast<int>(settings.getInteger("NpcInfoShow", "Height", 0));
+        const QString relativePath = "ini/ui/npcinfo/window.ini";
+        const QString outputPath = appendPath(outputDir, relativePath);
+        INIFileEditor window;
+        if (width > 0 && height > 0 &&
+            !QFileInfo(appendPath(sourceDir, relativePath)).isFile())
+        {
+            window.setInteger("Init", "Width", width);
+            window.setInteger("Init", "Height", height);
+            window.set("Init", "Align", "alTopCenter");
+            window.setInteger("Init", "AlignX", settings.getInteger("NpcInfoShow", "LeftAdjust", 0));
+            window.setInteger("Init", "AlignY", settings.getInteger("NpcInfoShow", "TopAdjust", 50));
+            const bool written = writeTextFileUtf8(outputPath, window.saveToString(), false, report);
+            appendFileOutcome(report, "content/ui/ui_settings.ini", relativePath,
+                AssetResourceType::Other,
+                written ? AssetMigrationFileAction::Convert : AssetMigrationFileAction::Fail,
+                written ? "legacy-ui-viewport-layout" : "legacy-ui-layout-write-failed",
+                QString::fromUtf8("转换 C# 目标血条尺寸与顶部偏移"), false);
+            if (!written)
+            {
+                report.errorCount++;
+                domainReportFor(report, AssetResourceType::Other).failedFiles++;
+            }
+        }
+    }
+    const QString titleWindowPath = "ini/ui/title/window.ini";
+    const QString titleWindowOutput = appendPath(outputDir, titleWindowPath);
+    INIFileEditor titleWindow;
+    const bool titleWindowLoaded = titleWindow.loadFromFile(titleWindowOutput.toUtf8().toStdString());
+    if (titleWindowLoaded && titleWindow.hasKey("Init", "Align"))
+    {
+        return;
+    }
+    if (titleWindowLoaded &&
+        titleWindow.getBoolean("Init", "ScaleChildren", true) &&
+        (!titleWindow.hasKey("Init", "Stretch") || titleWindow.getBoolean("Init", "Stretch")) &&
+        titleWindow.getInteger("Init", "Width", 0) > 0 && titleWindow.getInteger("Init", "Height", 0) > 0)
+    {
+        QString image = QString::fromUtf8(titleWindow.get("Init", "Image", titleWindow.get("Init", "Bitmap")).c_str());
+        image.replace('\\', '/');
+        while (image.startsWith('/'))
+            image.remove(0, 1);
+        PicFileEditor picture;
+        if (!image.isEmpty() && isSafeRelativeSubdirectory(image) &&
+            (picture.loadFromFile(appendPath(outputDir, image).toUtf8().toStdString()) ||
+                picture.loadFromFile(appendPath(sourceDir, image).toUtf8().toStdString()) ||
+                (!uiBaseRoot.isEmpty() && picture.loadFromFile(appendPath(uiBaseRoot, image).toUtf8().toStdString()))))
+        {
+            // A legacy title's viewport anchor is required even when it has no
+            // C# settings file. Otherwise child scaling still uses a fixed window.
+            titleWindow.set("Init", "Align", "alClient");
+            for (const char* key : {"AlignX", "AlignY"})
+            {
+                if (!titleWindow.hasKey("Init", key))
+                    titleWindow.setInteger("Init", key, 0);
+            }
+            titleWindow.setBoolean("Init", "Stretch", true);
+            if (!titleWindow.hasKey("Init", "KeepAspect"))
+                titleWindow.setBoolean("Init", "KeepAspect", true);
+            const bool written = writeTextFileUtf8(titleWindowOutput, titleWindow.saveToString(), false, report);
+            appendFileOutcome(report, titleWindowPath, titleWindowPath, AssetResourceType::Other,
+                written ? AssetMigrationFileAction::Convert : AssetMigrationFileAction::Fail,
+                written ? "legacy-title-window-layout" : "legacy-title-window-layout-write-failed",
+                QString::fromUtf8("补齐旧标题背景与按钮共用的窗口缩放锚点"), false);
+            if (!written)
+            {
+                report.errorCount++;
+                domainReportFor(report, AssetResourceType::Other).failedFiles++;
+            }
+        }
+    }
+    const QPair<const char*, const char*> titleButtons[] = {
+        {"initbtn", "Title_Btn_Begin"}, {"loadbtn", "Title_Btn_Load"},
+        {"teambtn", "Title_Btn_Team"}, {"exitbtn", "Title_Btn_Exit"}
+    };
+    for (const auto& item : titleButtons)
+    {
+        const bool hasSettings = settings.hasSection(item.second);
+        if (!hasSettings && !titleWindow.getBoolean("Init", "ScaleChildren", true))
+            continue;
+        const QString relativePath = QString("ini/ui/title/%1.ini").arg(item.first);
+        const QString outputPath = appendPath(outputDir, relativePath);
+        INIFileEditor button;
+        if (!button.loadFromFile(outputPath.toUtf8().toStdString()) ||
+            button.hasKey("Init", "Align") ||
+            button.hasKey("Init", "Stretch"))
+            continue;
+        int width = static_cast<int>(settings.getInteger(item.second, "Width", button.getInteger("Init", "Width", 0)));
+        int height = static_cast<int>(settings.getInteger(item.second, "Height", button.getInteger("Init", "Height", 0)));
+        QString image = QString::fromUtf8(settings.get(item.second, "Image", button.get("Init", "Image")).c_str());
+        image.replace('\\', '/');
+        while (image.startsWith('/'))
+            image.remove(0, 1);
+        PicFileEditor picture;
+        if (image.isEmpty() || !isSafeRelativeSubdirectory(image))
+            continue;
+        const bool imageLoaded = picture.loadFromFile(appendPath(sourceDir, image).toUtf8().toStdString()) ||
+            (!uiBaseRoot.isEmpty() && picture.loadFromFile(appendPath(uiBaseRoot, image).toUtf8().toStdString()));
+        if (imageLoaded)
+        {
+            const QImage frame = picture.getFrameImage(0);
+            if (!frame.isNull())
+            {
+                width = frame.width();
+                height = frame.height();
+            }
+        }
+        else if (!hasSettings)
+            continue;
+        if (width <= 0 || height <= 0)
+            continue;
+        // C# draws the texture at its native size. Make the hit rectangle use
+        // that same size, then let both follow the title's uniform transform.
+        if (hasSettings)
+        {
+            button.setInteger("Init", "Left", settings.getInteger(item.second, "Left", 0));
+            button.setInteger("Init", "Top", settings.getInteger(item.second, "Top", 0));
+        }
+        button.setInteger("Init", "Width", width);
+        button.setInteger("Init", "Height", height);
+        button.setBoolean("Init", "Stretch", true);
+        const bool written = writeTextFileUtf8(outputPath, button.saveToString(), false, report);
+        appendFileOutcome(report, hasSettings ? "content/ui/ui_settings.ini" : relativePath, relativePath,
+            AssetResourceType::Other,
+            written ? AssetMigrationFileAction::Convert : AssetMigrationFileAction::Fail,
+            written ? "legacy-title-button-layout" : "legacy-title-button-layout-write-failed",
+            QString::fromUtf8("将标题按钮图像与点击区域置于同一缩放布局"), false);
+        if (!written)
+        {
+            report.errorCount++;
+            domainReportFor(report, AssetResourceType::Other).failedFiles++;
+        }
+    }
+}
+
+void JxAssetMigrator::ensureChooseMenuDefinition(
+    const QString& outputDir,
+    const QString& uiBaseRoot,
+    AssetMigrationReport& report)
+{
+    const QString relativePath = "ini/ui/choose/choose.menu.ini";
+    auto suppliedFile = [&](const QString& path)
+    {
+        return QFileInfo(appendPath(outputDir, path)).isFile() ||
+            (!uiBaseRoot.isEmpty() && QFileInfo(appendPath(uiBaseRoot, path)).isFile());
+    };
+    if (suppliedFile(relativePath))
+        return;
+
+    const bool hasLocalChoice = QFileInfo(appendPath(outputDir, "ini/ui/choose")).exists();
+    const bool hasLocalDialog = QFileInfo(appendPath(outputDir, "ini/ui/dialog/window.ini")).isFile();
+    if (!hasLocalChoice && !hasLocalDialog)
+        return;
+
+    QStringList missingLayout;
+    for (const QString& file : {QString("window.ini"), QString("label.ini"),
+             QString("btna.ini"), QString("btnb.ini")})
+    {
+        const QString path = "ini/ui/choose/" + file;
+        if (!suppliedFile(path))
+            missingLayout.append(path);
+    }
+    if (!missingLayout.isEmpty())
+    {
+        report.warningCount++;
+        report.logLines.append(QString::fromUtf8(
+            "警告: 缺少选择菜单布局配置，未生成菜单定义；请在资源中补齐: %1")
+            .arg(missingLayout.join(", ")));
+        return;
+    }
+
+    const QString menu =
+        "[menu]\n"
+        "name=ChooseMenu\n"
+        "visible=false\n"
+        "window=ini\\ui\\choose\\window.ini\n\n"
+        "[component1]\n"
+        "type=Label\n"
+        "name=messageLabel\n"
+        "file=ini\\ui\\choose\\label.ini\n\n"
+        "[component2]\n"
+        "type=ChooseTextButton\n"
+        "name=selectA\n"
+        "file=ini\\ui\\choose\\btna.ini\n\n"
+        "[component3]\n"
+        "type=ChooseTextButton\n"
+        "name=selectB\n"
+        "file=ini\\ui\\choose\\btnb.ini\n";
+
+    const bool written = writeTextFileUtf8(
+        appendPath(outputDir, relativePath), menu.toUtf8().toStdString(), false, report);
+    appendFileOutcome(
+        report,
+        QStringLiteral("<generated:choose-menu>"),
+        relativePath,
+        AssetResourceType::Other,
+        written ? AssetMigrationFileAction::Convert : AssetMigrationFileAction::Fail,
+        written ? QStringLiteral("generated-choose-menu")
+                : QStringLiteral("generated-choose-menu-write-failed"),
+        written ? QString::fromUtf8("根据现有选择布局组装菜单定义")
+                : QString::fromUtf8("无法写入选择菜单定义"),
+        false);
+    if (!written)
+    {
+        report.errorCount++;
+        domainReportFor(report, AssetResourceType::Other).failedFiles++;
+        report.logLines.append(QString::fromUtf8("错误: 无法写入选择菜单定义 %1").arg(relativePath));
+    }
+}
+
+bool JxAssetMigrator::writeModProfileFile(const QString& outputDir, const AssetMigrationOptions& options,
+    AssetMigrationReport& report)
+{
+    QString id = options.modId.trimmed();
+    if (id.isEmpty())
+        id = QFileInfo(outputDir).fileName();
+    if (id.isEmpty())
+        id = "MOD";
+
+    QString name = options.modName.trimmed();
+    if (name.isEmpty())
+        name = id;
+
+    QString saveNamespace = options.saveNamespace.trimmed();
+    if (saveNamespace.isEmpty())
+        saveNamespace = id;
+
+    const QString profilePath =
+        appendPath(
+            outputDir,
+            QStringLiteral(
+                "game_profile.ini"));
+    const bool sourceProfileExists =
+        QFileInfo(profilePath).isFile();
+    GameProfile profile;
+    if (sourceProfileExists)
+    {
+        if (!profile.loadFromFile(
+                profilePath))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        profile.startupVideos.clear();
+        profile.titleMenu =
+            QStringLiteral(
+                "ini\\ui\\title\\title.menu.ini");
+        profile.titleNewYearMenu.clear();
+        profile.titleMusic = defaultTitleMusicForOptions(options);
+        profile.titleTeamVideo.clear();
+        profile.teamInfoFile.clear();
+        profile.newGameScript =
+            QStringLiteral("newgame.txt");
+    }
+
+    if (options.titleMusicDefined)
+    {
+        profile.titleMusic = options.titleMusic;
+    }
+    profile.defeatedNpcExperienceMode =
+        options.defeatedNpcExperienceMode;
+    profile.defeatedNpcExperienceModeDefined =
+        options.defeatedNpcExperienceModeDefined;
+    profile.levelUpThresholdMode = options.levelUpThresholdMode;
+    profile.levelUpThresholdModeDefined =
+        options.levelUpThresholdModeDefined;
+    profile.partnerFollowRadius = options.partnerFollowRadius;
+    profile.partnerFollowRadiusDefined =
+        options.partnerFollowRadiusDefined;
+    profile.partnerFollowRunRadius = options.partnerFollowRunRadius;
+    profile.partnerFollowRunRadiusDefined =
+        options.partnerFollowRunRadiusDefined;
+    profile.minimumMagicDamage = options.minimumMagicDamage;
+    profile.attackReleaseFrameRatio = options.attackReleaseFrameRatio;
+    profile.attackReleaseFrameRatioDefined = options.attackReleaseFrameRatioDefined;
+    profile.specialAttackReleaseFrameRatio = options.specialAttackReleaseFrameRatio;
+    profile.specialAttackReleaseFrameRatioDefined = options.specialAttackReleaseFrameRatioDefined;
+    profile.magicReleaseFrameRatio = options.magicReleaseFrameRatio;
+    profile.magicReleaseFrameRatioDefined = options.magicReleaseFrameRatioDefined;
+    profile.minimumMagicDamageDefined = true;
+    profile.magicEffectCalculationMode =
+        options.magicEffectCalculationMode;
+    profile.magicEffectCalculationModeDefined = true;
+    profile.npcActionProfile = options.npcActionProfile;
+    profile.npcActionProfileDefined = options.npcActionProfileDefined;
+    profile.npcRuntimeProfile = options.npcRuntimeProfile;
+    profile.npcRuntimeProfileDefined = options.npcRuntimeProfileDefined;
+    profile.specialActionMode = options.specialActionMode;
+    profile.specialActionModeDefined = options.specialActionModeDefined;
+    profile.addLifeMode = options.addLifeMode;
+    profile.addLifeModeDefined = options.addLifeModeDefined;
+
+    profile.id = id;
+    profile.name = name;
+    profile.typeDefined =
+        options.modType >= 0;
+    profile.type =
+        options.modType >= 0
+        ? options.modType
+        : 0;
+    profile.dependencyId =
+        options.dependencyId.trimmed();
+    profile.textEncodingConverted = true;
+    profile.uiBaseId =
+        options.uiBaseId.trimmed();
+    profile.uiProfile =
+        options.uiProfile.trimmed().
+            toUpper();
+    profile.preferLocalUi =
+        options.preferLocalUi;
+    profile.features =
+        options.features;
+    profile.saveNamespace =
+        saveNamespace;
+
+    if (shouldFailFileSystemOperation(
+            FileSystemOperation::
+                PrepareModProfileOutput,
+            profilePath))
+    {
+        return false;
+    }
+
+    QByteArray profileBytes;
+    if (!profile.prepareSaveBytes(
+            profilePath,
+            profileBytes))
+    {
+        if (!sourceProfileExists)
+        {
+            appendFileOutcome(
+                report,
+                QStringLiteral("<generated:game-profile>"),
+                QStringLiteral("game_profile.ini"),
+                AssetResourceType::Other,
+                AssetMigrationFileAction::Fail,
+                QStringLiteral(
+                    "generated-game-profile-prepare-failed"),
+                QString::fromUtf8(
+                    "无法准备默认资源包清单内容"),
+                false);
+        }
+        return false;
+    }
+    const bool written = writeTextFileUtf8(
+        profilePath,
+        std::string(
+            profileBytes.constData(),
+            static_cast<std::size_t>(
+                profileBytes.size())),
+        false,
+        report);
+    if (written && !sourceProfileExists)
+    {
+        appendFileOutcome(
+            report,
+            QStringLiteral("<generated:game-profile>"),
+            QStringLiteral("game_profile.ini"),
+            AssetResourceType::Other,
+            AssetMigrationFileAction::Convert,
+            QStringLiteral("generated-game-profile"),
+            QString::fromUtf8(
+                "源目录未提供资源包清单，按转换选项生成默认清单"),
+            false);
+    }
+    else if (!written &&
+             !sourceProfileExists)
+    {
+        appendFileOutcome(
+            report,
+            QStringLiteral("<generated:game-profile>"),
+            QStringLiteral("game_profile.ini"),
+            AssetResourceType::Other,
+            AssetMigrationFileAction::Fail,
+            QStringLiteral(
+                "generated-game-profile-write-failed"),
+            QString::fromUtf8(
+                "无法写入默认资源包清单"),
+            false);
+    }
+    return written;
+}
+
+void JxAssetMigrator::scanUnsupportedScriptApis(const std::string& convertedContent, const QString& sourcePath, AssetMigrationReport& report) const
+{
+    QString text = QString::fromUtf8(convertedContent.data(), static_cast<int>(convertedContent.size()));
+    QStringList calls = scanCallsOutsideStrings(text);
+
+    QSet<QString> existing;
+    for (const QString& item : report.unsupportedScriptApis)
+        existing.insert(item);
+    for (const QString& call : calls)
+    {
+        if (ScriptConverter::isSupportedRuntimeApi(call.toStdString()) ||
+            call == "if" || call == "goto" || call == "return" ||
+            call == "and" || call == "or" || call == "not")
+            continue;
+        QString item = QString("%1: %2").arg(call, sourcePath);
+        if (!existing.contains(item))
+        {
+            report.unsupportedScriptApis.append(item);
+            existing.insert(item);
+            report.warningCount++;
+            report.logLines.append(QString::fromUtf8("警告: 脚本 API 未处理 %1").arg(item));
+        }
+    }
+}
+
+bool JxAssetMigrator::writeReportFile(const QString& outputDir, AssetMigrationReport& report) const
+{
+    QString reportPath = appendPath(outputDir, "migration_report.txt");
+    report.reportFilePath.clear();
+    if (!ensureParentDirectory(reportPath))
+        return false;
+
+    QSaveFile file(reportPath);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+
+    QTextStream stream(&file);
+    stream.setEncoding(QStringConverter::Utf8);
+    stream << "JX legacy assets conversion report\n";
+    stream << "Selected resource types: "
+        << report.selectedResourceTypes.join(QStringLiteral(", ")) << "\n";
+    stream << "Complete project: " << (report.completeProject ? "yes" : "no") << "\n";
+    stream << "Resource domains:\n";
+    for (AssetResourceType domain : assetResourceDomainTypes())
+    {
+        const QString id = assetResourceTypeId(domain);
+        const AssetResourceDomainReport domainReport =
+            report.resourceDomains.value(id);
+        stream << "  " << id
+            << ": selected=" << (domainReport.selected ? "yes" : "no")
+            << ", processed=" << domainReport.processedFiles
+            << ", written=" << domainReport.writtenFiles
+            << ", failed=" << domainReport.failedFiles << "\n";
+    }
+    stream << "Legacy image modes:\n";
+    for (const LegacyImageCategoryDefinition& item :
+         LegacyImageMigrationPolicy::definitions())
+    {
+        stream << "  " << item.id << "="
+            << report.legacyImageModes.value(item.id) << "\n";
+    }
+    stream << "Crop transparent: requested="
+        << (report.cropTransparentRequested ? "true" : "false")
+        << ", effective="
+        << (report.cropTransparentEffective ? "true" : "false") << "\n";
+    stream << "Processed files: " << report.processedFiles << "\n";
+    stream << "Written files: " << report.writtenFiles << "\n";
+    stream << "Dependency duplicate files: "
+        << report.dependencyDuplicateFiles << "\n";
+    stream << "Dependency duplicate bytes: "
+        << report.dependencyDuplicateBytes << "\n";
+    stream << "Warnings: " << report.warningCount << "\n";
+    stream << "Errors: " << report.errorCount << "\n";
+    stream << "convertedAndCropped: " << report.convertedAndCropped << "\n";
+    stream << "convertedWithoutCrop: " << report.convertedWithoutCrop << "\n";
+    stream << "preservedImages: " << report.preservedImages << "\n";
+    stream << "convertedMaps: " << report.convertedMaps << "\n";
+    stream << "preservedMapImages: " << report.preservedMapImages << "\n";
+    stream << "skippedUnknownImages: " << report.skippedUnknownImages << "\n";
+    stream << "failedImages: " << report.failedImages << "\n";
+    stream << "Unsupported script APIs: " << report.unsupportedScriptApis.size() << "\n";
+    stream << "Unhandled script statements: " << report.unhandledScriptStatements.size() << "\n";
+    stream << "Script syntax files: total " << report.scriptSyntaxTotalFiles
+        << ", checked " << report.scriptSyntaxCheckedFiles
+        << ", skipped " << report.scriptSyntaxSkippedFiles << "\n";
+    stream << "Script syntax errors: " << report.scriptSyntaxErrors.size() << "\n\n";
+    stream << "Unavailable scripts: "
+        << report.unavailableScripts.size() << "\n";
+    stream << "Managed output SHA-256 entries: "
+        << report.managedOutputSha256.size() << "\n";
+    stream << "File outcomes: "
+        << report.fileOutcomes.size() << "\n\n";
+
+    if (!report.unsupportedScriptApis.isEmpty())
+    {
+        stream << "Unsupported script APIs:\n";
+        for (const QString& item : report.unsupportedScriptApis)
+            stream << "  " << item << "\n";
+        stream << "\n";
+    }
+
+    if (!report.unhandledScriptStatements.isEmpty())
+    {
+        stream << "Unhandled script statements:\n";
+        for (const QString& item : report.unhandledScriptStatements)
+            stream << "  " << item << "\n";
+        stream << "\n";
+    }
+
+    if (!report.scriptSyntaxErrors.isEmpty())
+    {
+        stream << "Script syntax errors:\n";
+        for (const QString& item : report.scriptSyntaxErrors)
+            stream << "  " << item << "\n";
+        stream << "\n";
+    }
+
+    if (!report.unavailableScripts.isEmpty())
+    {
+        stream << "Unavailable scripts:\n";
+        for (const QString& item :
+             report.unavailableScripts)
+        {
+            stream << "  " << item << "\n";
+        }
+        stream << "\n";
+    }
+
+    stream << "File outcomes:\n";
+    for (const AssetMigrationFileOutcome& outcome :
+         report.fileOutcomes)
+    {
+        QString message = outcome.message;
+        message.replace(
+            QRegularExpression(
+                QStringLiteral("[\\r\\n\\t]+")),
+            QStringLiteral(" "));
+        stream << "  ["
+            << assetMigrationFileActionId(
+                   outcome.action)
+            << "] type=" << outcome.entryType
+            << " source=" << outcome.sourcePath
+            << " output=" << outcome.outputPath
+            << " domain=" << outcome.domain
+            << " reason=" << outcome.reason
+            << " sourceScan="
+            << (outcome.sourceScan ? "yes" : "no");
+        if (!outcome.outputSha256.isEmpty())
+            stream << " sha256=" << outcome.outputSha256;
+        if (!message.isEmpty())
+            stream << " message=" << message;
+        stream << "\n";
+    }
+    stream << "\n";
+
+    stream << "Log:\n";
+    for (const QString& line : report.logLines)
+        stream << "  " << line << "\n";
+
+    stream.flush();
+    bool ok = stream.status() != QTextStream::WriteFailed;
+    if (!ok)
+    {
+        file.cancelWriting();
+        return false;
+    }
+    if (shouldFailFileSystemOperation(
+            FileSystemOperation::CommitTextReport, reportPath) ||
+        !file.commit())
+    {
+        file.cancelWriting();
+        return false;
+    }
+
+    report.reportFilePath = reportPath;
+    return true;
+}
+
+bool JxAssetMigrator::writeReportJsonFile(const QString& outputDir, AssetMigrationReport& report, MigrationResult status)
+{
+    QString reportPath = appendPath(outputDir, "migration_report.json");
+    report.reportJsonFilePath.clear();
+    if (!ensureParentDirectory(reportPath))
+        return false;
+
+    QJsonObject root;
+
+    // Status
+    QString statusString;
+    switch (status)
+    {
+    case MigrationResult::Success: statusString = "Success"; break;
+    case MigrationResult::Partial: statusString = "Partial"; break;
+    case MigrationResult::Failed: statusString = "Failed"; break;
+    }
+    root["status"] = statusString;
+    root["cancelled"] = report.cancelled;
+    root["completeProject"] = report.completeProject;
+
+    QJsonArray selectedResourceTypes;
+    for (const QString& type : report.selectedResourceTypes)
+        selectedResourceTypes.append(type);
+    root["selectedResourceTypes"] = selectedResourceTypes;
+
+    QJsonObject resourceDomains;
+    for (AssetResourceType domain : assetResourceDomainTypes())
+    {
+        const QString id = assetResourceTypeId(domain);
+        const AssetResourceDomainReport domainReport =
+            report.resourceDomains.value(id);
+        QJsonObject domainObject;
+        domainObject["selected"] = domainReport.selected;
+        domainObject["processed"] = domainReport.processedFiles;
+        domainObject["written"] = domainReport.writtenFiles;
+        domainObject["failed"] = domainReport.failedFiles;
+        resourceDomains[id] = domainObject;
+    }
+    root["resourceDomains"] = resourceDomains;
+
+    QJsonObject legacyImageModes;
+    for (const LegacyImageCategoryDefinition& item :
+         LegacyImageMigrationPolicy::definitions())
+    {
+        legacyImageModes[item.id] =
+            report.legacyImageModes.value(item.id);
+    }
+    QJsonObject legacyImages;
+    legacyImages["modes"] = legacyImageModes;
+    legacyImages["cropTransparent"] = report.cropTransparentRequested;
+    legacyImages["effectiveCropTransparent"] =
+        report.cropTransparentEffective;
+    root["legacyImages"] = legacyImages;
+
+    // Counts
+    QJsonObject counts;
+    counts["processed"] = report.processedFiles;
+    counts["written"] = report.writtenFiles;
+    counts["dependencyDuplicateFiles"] =
+        report.dependencyDuplicateFiles;
+    counts["dependencyDuplicateBytes"] =
+        static_cast<qint64>(
+            report.dependencyDuplicateBytes);
+    counts["warnings"] = report.warningCount;
+    counts["errors"] = report.errorCount;
+    counts["convertedAndCropped"] = report.convertedAndCropped;
+    counts["convertedWithoutCrop"] = report.convertedWithoutCrop;
+    counts["preservedImages"] = report.preservedImages;
+    counts["convertedMaps"] = report.convertedMaps;
+    counts["preservedMapImages"] = report.preservedMapImages;
+    counts["skippedUnknownImages"] = report.skippedUnknownImages;
+    counts["failedImages"] = report.failedImages;
+    counts["unsupportedScriptApis"] = report.unsupportedScriptApis.size();
+    counts["unhandledScriptStatements"] = report.unhandledScriptStatements.size();
+    counts["scriptSyntaxTotalFiles"] = report.scriptSyntaxTotalFiles;
+    counts["scriptSyntaxCheckedFiles"] = report.scriptSyntaxCheckedFiles;
+    counts["scriptSyntaxSkippedFiles"] = report.scriptSyntaxSkippedFiles;
+    counts["scriptSyntaxErrors"] = report.scriptSyntaxErrors.size();
+    counts["unavailableScripts"] =
+        report.unavailableScripts.size();
+    counts["managedOutputSha256"] =
+        report.managedOutputSha256.size();
+    counts["fileOutcomes"] =
+        report.fileOutcomes.size();
+    root["counts"] = counts;
+
+    // Unsupported script APIs
+    QJsonArray apisArray;
+    for (const QString& api : report.unsupportedScriptApis)
+        apisArray.append(api);
+    if (!apisArray.isEmpty())
+        root["unsupportedScriptApis"] = apisArray;
+
+    QJsonArray unhandledArray;
+    for (const QString& item : report.unhandledScriptStatements)
+        unhandledArray.append(item);
+    if (!unhandledArray.isEmpty())
+        root["unhandledScriptStatements"] = unhandledArray;
+
+    QJsonArray syntaxErrorsArray;
+    for (const QString& item : report.scriptSyntaxErrors)
+        syntaxErrorsArray.append(item);
+    root["scriptSyntaxErrors"] = syntaxErrorsArray;
+
+    QJsonArray unavailableScripts;
+    for (const QString& item :
+         report.unavailableScripts)
+    {
+        unavailableScripts.append(item);
+    }
+    root["unavailableScripts"] =
+        unavailableScripts;
+
+    QJsonObject managedOutputSha256;
+    for (auto digest =
+             report.managedOutputSha256.cbegin();
+         digest !=
+             report.managedOutputSha256.cend();
+         ++digest)
+    {
+        managedOutputSha256.insert(
+            digest.key(),
+            digest.value());
+    }
+    root["managedOutputSha256"] =
+        managedOutputSha256;
+    root["publishWarning"] =
+        report.publishWarning;
+    root["retainedBackupPath"] =
+        report.retainedBackupPath;
+    QJsonArray logLines;
+    for (const QString& line :
+         report.logLines)
+    {
+        logLines.append(line);
+    }
+    root["logLines"] =
+        logLines;
+
+    QJsonArray fileOutcomes;
+    for (const AssetMigrationFileOutcome& outcome :
+         report.fileOutcomes)
+    {
+        QJsonObject fileOutcome;
+        fileOutcome["source"] =
+            outcome.sourcePath;
+        fileOutcome["output"] =
+            outcome.outputPath;
+        fileOutcome["outputSha256"] =
+            outcome.outputSha256;
+        fileOutcome["domain"] =
+            outcome.domain;
+        fileOutcome["entryType"] =
+            outcome.entryType;
+        fileOutcome["action"] =
+            assetMigrationFileActionId(
+                outcome.action);
+        fileOutcome["reason"] =
+            outcome.reason;
+        fileOutcome["message"] =
+            outcome.message;
+        fileOutcome["sourceScan"] =
+            outcome.sourceScan;
+        fileOutcomes.append(fileOutcome);
+    }
+    root["files"] = fileOutcomes;
+
+    QSaveFile file(reportPath);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+
+    QJsonDocument doc(root);
+    QByteArray payload = doc.toJson();
+    // Detect short writes and flush/close errors (e.g. disk full), not just
+    // outright write failures, so callers don't report a JSON file that was
+    // never fully written.
+    bool ok = (file.write(payload) == payload.size());
+    if (!ok)
+    {
+        file.cancelWriting();
+        return false;
+    }
+    if (shouldFailFileSystemOperation(
+            FileSystemOperation::CommitJsonReport, reportPath) ||
+        !file.commit())
+    {
+        file.cancelWriting();
+        return false;
+    }
+
+    report.reportJsonFilePath = reportPath;
+    return true;
+}
+
+void JxAssetMigrator::appendReportLog(AssetMigrationReport& report, const LogCallback& logCallback, const QString& message)
+{
+    report.logLines.append(message);
+    if (logCallback)
+        logCallback(message);
+}
+
+#if defined(JXQY_EDITOR_ENABLE_TEST_HOOKS)
+void JxAssetMigrator::setFileSystemFaultInjectorForTests(
+    FileSystemFaultInjector injector)
+{
+    fileSystemFaultInjector() = std::move(injector);
+}
+#endif
+
+void JxAssetMigrator::convertTalkDatToTalkIndex(const QString& inputDir, const QString& outputDir,
+    const AssetMigrationOptions& options, AssetMigrationReport& report, const LogCallback& logCallback)
+{
+    QString talkIdxPath = appendPath(inputDir, "script/common/Talkidx.dat");
+    QString talkDatPath = appendPath(inputDir, "script/common/Talk.dat");
+
+    const QFileInfo talkIndexInformation(
+        talkIdxPath);
+    const QFileInfo talkDataInformation(
+        talkDatPath);
+    if (!talkIndexInformation.isFile() ||
+        isFileSystemLink(
+            talkIndexInformation) ||
+        !talkDataInformation.isFile() ||
+        isFileSystemLink(
+            talkDataInformation))
+    {
+        return;
+    }
+
+    appendReportLog(report, logCallback, QString::fromUtf8("发现 Talk.dat/Talkidx.dat，开始转换为 talkindex.txt"));
+
+    // Read Talkidx.dat binary index
+    std::vector<uint8_t> idxBuffer = Util::readFileToBuffer(talkIdxPath.toUtf8().toStdString());
+    if (idxBuffer.empty() || idxBuffer.size() % 12 != 0)
+    {
+        report.warningCount++;
+        appendReportLog(report, logCallback, QString::fromUtf8("警告: Talkidx.dat 格式异常，跳过对话转换"));
+        return;
+    }
+
+    // Read Talk.dat text data
+    std::vector<uint8_t> datBuffer = Util::readFileToBuffer(talkDatPath.toUtf8().toStdString());
+    if (datBuffer.empty())
+    {
+        report.warningCount++;
+        appendReportLog(report, logCallback, QString::fromUtf8("警告: Talk.dat 读取失败，跳过对话转换"));
+        return;
+    }
+
+    size_t entryCount = idxBuffer.size() / 12;
+    struct TalkEntry
+    {
+        uint32_t talkIndex;
+        uint32_t portraitIndex;
+        uint32_t offset;
+    };
+
+    std::vector<TalkEntry> entries(entryCount);
+    for (size_t i = 0; i < entryCount; i++)
+    {
+        const uint8_t* p = idxBuffer.data() + i * 12;
+        entries[i].talkIndex = static_cast<uint32_t>(p[0]) |
+            (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) |
+            (static_cast<uint32_t>(p[3]) << 24);
+        entries[i].portraitIndex = static_cast<uint32_t>(p[4]) |
+            (static_cast<uint32_t>(p[5]) << 8) |
+            (static_cast<uint32_t>(p[6]) << 16) |
+            (static_cast<uint32_t>(p[7]) << 24);
+        entries[i].offset = static_cast<uint32_t>(p[8]) |
+            (static_cast<uint32_t>(p[9]) << 8) |
+            (static_cast<uint32_t>(p[10]) << 16) |
+            (static_cast<uint32_t>(p[11]) << 24);
+    }
+
+    // Build talkindex.txt content
+    std::string output;
+    output.reserve(datBuffer.size() * 2);
+    int convertedEntries = 0;
+    for (size_t i = 0; i < entryCount; i++)
+    {
+        uint32_t startOffset = entries[i].offset;
+        uint32_t endOffset = (i + 1 < entryCount) ? entries[i + 1].offset : static_cast<uint32_t>(datBuffer.size());
+
+        if (startOffset >= datBuffer.size() || endOffset > datBuffer.size() || startOffset > endOffset)
+        {
+            report.warningCount++;
+            continue;
+        }
+
+        std::string rawText(datBuffer.data() + startOffset, datBuffer.data() + endOffset);
+        size_t nullPos = rawText.find('\0');
+        if (nullPos != std::string::npos)
+            rawText.resize(nullPos);
+
+        std::string utf8Text;
+        if (!convertLegacyJxTextToUtf8(rawText, options.sourceEncoding, utf8Text))
+        {
+            report.warningCount++;
+            appendReportLog(report, logCallback,
+                QString::fromUtf8("警告: Talk.dat 条目 %1 编码转换失败，已跳过")
+                    .arg(entries[i].talkIndex));
+            continue;
+        }
+
+        output += "[" + std::to_string(entries[i].talkIndex) + "," +
+            std::to_string(entries[i].portraitIndex) + "]" + utf8Text + "\n";
+        convertedEntries++;
+    }
+
+    QString outputPath = appendPath(outputDir, "script/common/talkindex.txt");
+    const bool wroteCommonTalkIndex = writeTextFileUtf8(outputPath, output, false, report);
+    const QString rootOutputPath =
+        appendPath(
+            outputDir,
+            QStringLiteral(
+                "talkindex.txt"));
+    const bool wroteRootTalkIndex =
+        writeTextFileUtf8(
+            rootOutputPath,
+            output,
+            false,
+            report);
+    const auto appendGeneratedOutcome =
+        [&](const QString& relativePath,
+            bool written)
+    {
+        appendFileOutcome(
+            report,
+            QStringLiteral(
+                "script/common/Talk.dat + "
+                "script/common/Talkidx.dat"),
+            relativePath,
+            AssetResourceType::Scripts,
+            written
+                ? AssetMigrationFileAction::
+                      Convert
+                : AssetMigrationFileAction::
+                      Fail,
+            written
+                ? QStringLiteral(
+                      "generated-talk-index")
+                : QStringLiteral(
+                      "generated-talk-index-write-failed"),
+            written
+                ? QString::fromUtf8(
+                      "由 staging 中受控的 Talk.dat/"
+                      "Talkidx.dat 生成")
+                : QString::fromUtf8(
+                      "无法写入 Talk 派生索引"),
+            false);
+        if (!written)
+        {
+            domainReportFor(
+                report,
+                AssetResourceType::Scripts).
+                failedFiles++;
+        }
+    };
+    appendGeneratedOutcome(
+        QStringLiteral(
+            "script/common/talkindex.txt"),
+        wroteCommonTalkIndex);
+    appendGeneratedOutcome(
+        QStringLiteral("talkindex.txt"),
+        wroteRootTalkIndex);
+    if (wroteCommonTalkIndex && wroteRootTalkIndex)
+    {
+        appendReportLog(report, logCallback,
+            QString::fromUtf8("已转换 Talk.dat/Talkidx.dat -> talkindex.txt (%1/%2 条对话)")
+                .arg(convertedEntries)
+                .arg(entryCount));
+    }
+    else
+    {
+        report.errorCount++;
+        appendReportLog(report, logCallback, QString::fromUtf8("错误: talkindex.txt 写入失败"));
+    }
+}

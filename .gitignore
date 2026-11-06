@@ -1,0 +1,27 @@
+# Private credentials and signing files
+.local-signing/
+**/*.p12
+**/*.jks
+**/*.keystore
+**/*.pfx
+**/*.pem
+**/*.key
+.env
+.env.*
+
+# Local game assets and tools
+build-local/
+downloads/
+delivery/
+artwork/
+upstream/ThirdParty/devel/
+upstream/android/local.properties
+upstream/android/app/libs/
+upstream/android/app/.cxx/
+**/.gradle/
+**/build/
+**/__pycache__/
+*.apk
+*.aab
+*.log
+*.tmp

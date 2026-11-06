@@ -1,0 +1,257 @@
+#include "../Game/Data/MobileTouchInteraction.h"
+#include "../Game/Data/MobileCheatPanelLayout.h"
+#include "../Game/Data/PlayerMovementIntent.h"
+#include "../Component/ItemTouchPolicy.h"
+
+#include <iostream>
+#include <vector>
+
+namespace
+{
+bool check(bool condition, const char* message)
+{
+	if (!condition)
+	{
+		std::cerr << "FAILED: " << message << '\n';
+	}
+	return condition;
+}
+
+bool checkDirectionList(
+	const std::vector<int>& actual,
+	const std::vector<int>& expected,
+	const char* message)
+{
+	if (actual == expected)
+	{
+		return true;
+	}
+
+	std::cerr << "FAILED: " << message << " actual:";
+	for (int direction : actual)
+	{
+		std::cerr << ' ' << direction;
+	}
+	std::cerr << " expected:";
+	for (int direction : expected)
+	{
+		std::cerr << ' ' << direction;
+	}
+	std::cerr << '\n';
+	return false;
+}
+bool checkLayoutWithinPanel(
+	const MobileCheatPanelLayout::Layout& layout,
+	const Rect& panel,
+	const char* message)
+{
+	for (std::size_t index = 0; index < layout.size(); ++index)
+	{
+		const Rect& rect = layout[index];
+		if (rect.w <= 0 || rect.h <= 0 || rect.x < panel.x || rect.y < panel.y
+			|| rect.x + rect.w > panel.x + panel.w
+			|| rect.y + rect.h > panel.y + panel.h)
+		{
+			std::cerr << "FAILED: " << message << " element " << index << '\n';
+			return false;
+		}
+		for (std::size_t other = 0; other < index; ++other)
+		{
+			const Rect& prior = layout[other];
+			const bool overlaps = rect.x < prior.x + prior.w
+				&& rect.x + rect.w > prior.x
+				&& rect.y < prior.y + prior.h
+				&& rect.y + rect.h > prior.y;
+			if (overlaps)
+			{
+				std::cerr << "FAILED: " << message << " overlap " << other
+					<< " and " << index << '\n';
+				return false;
+			}
+		}
+	}
+	return true;
+}
+}
+
+int main()
+{
+	bool ok = true;
+
+	const auto desktopLayout = MobileCheatPanelLayout::calculate(
+		{ 10, 20, 500, 600 }, false);
+	ok = check(desktopLayout[MobileCheatPanelLayout::CheatMode].h == 32
+		&& desktopLayout[MobileCheatPanelLayout::Back].y
+			- desktopLayout[MobileCheatPanelLayout::CheatMode].y == 6 * 36,
+		"desktop cheat layout preserves the existing button geometry") && ok;
+	const Rect tallPanel = { 10, 20, 420, 500 };
+	const auto tallMobileLayout = MobileCheatPanelLayout::calculate(tallPanel, true);
+	ok = check(checkLayoutWithinPanel(tallMobileLayout, tallPanel,
+		"tall mobile cheat layout is contained and non-overlapping"),
+		"tall mobile cheat layout fits") && ok;
+	const Rect tallScreenPanel =
+		MobileCheatPanelLayout::getCenteredPanelRect(1280, 800);
+	ok = check(tallScreenPanel.x >= 24 && tallScreenPanel.y >= 24
+		&& tallScreenPanel.x + tallScreenPanel.w <= 1280 - 24
+		&& tallScreenPanel.y + tallScreenPanel.h <= 800 - 24
+		&& tallScreenPanel.x * 2 + tallScreenPanel.w == 1280
+		&& tallScreenPanel.y * 2 + tallScreenPanel.h == 800,
+		"expanded mobile cheat panel is centered within screen safe margins") && ok;
+	const auto expandedTallLayout =
+		MobileCheatPanelLayout::calculate(tallScreenPanel, true);
+	ok = check(checkLayoutWithinPanel(expandedTallLayout, tallScreenPanel,
+		"expanded tall-screen panel controls stay in parent bounds"),
+		"expanded tall-screen controls are hit-testable within parent") && ok;
+	ok = check(expandedTallLayout[MobileCheatPanelLayout::CheatMode].h >= 40,
+		"expanded tall-screen mobile button meets 40 logical-pixel minimum") && ok;
+	const Rect shortScreenPanel =
+		MobileCheatPanelLayout::getCenteredPanelRect(1280, 480);
+	const auto expandedShortLayout =
+		MobileCheatPanelLayout::calculate(shortScreenPanel, true);
+	ok = check(checkLayoutWithinPanel(expandedShortLayout, shortScreenPanel,
+		"expanded short-screen controls stay in parent bounds"),
+		"expanded short-screen controls are hit-testable within parent") && ok;
+	ok = check(expandedShortLayout[MobileCheatPanelLayout::CheatMode].h >= 40,
+		"expanded short-screen mobile button meets 40 logical-pixel minimum") && ok;
+	ok = check(tallMobileLayout[MobileCheatPanelLayout::CheatMode].w > 0
+		&& tallMobileLayout[MobileCheatPanelLayout::CheatMode].h > 32,
+		"mobile cheat buttons grow beyond the desktop button height") && ok;
+	const Rect widePanel = { 4, 6, 900, 360 };
+	const auto wideMobileLayout = MobileCheatPanelLayout::calculate(widePanel, true);
+	ok = check(checkLayoutWithinPanel(wideMobileLayout, widePanel,
+		"wide mobile cheat layout is contained and non-overlapping"),
+		"wide mobile cheat layout fits") && ok;
+	ok = check(wideMobileLayout[MobileCheatPanelLayout::CheatMode].y
+		== wideMobileLayout[MobileCheatPanelLayout::Invincibility].y,
+		"wide mobile cheat layout uses two columns") && ok;
+	for (const Rect tinyPanel : { Rect{ 0, 0, 40, 40 }, Rect{ 2, 3, 160, 110 } })
+	{
+		const auto tinyLayout = MobileCheatPanelLayout::calculate(tinyPanel, true);
+		ok = check(checkLayoutWithinPanel(tinyLayout, tinyPanel,
+			"short mobile cheat layout is contained and non-overlapping"),
+			"short mobile cheat layout fits") && ok;
+	}
+
+	ok = check(shouldDeferMobileRightScriptChoice("primary.lua", "right.lua"),
+		"both primary and right scripts defer touch choice until finger-up") && ok;
+	ok = check(!shouldDeferMobileRightScriptChoice("", "right.lua"),
+		"right-only script keeps immediate primary fallback path") && ok;
+	ok = check(!shouldDeferMobileRightScriptChoice("primary.lua", ""),
+		"primary-only script does not defer") && ok;
+	const int smallItemTolerance =
+		ItemTouchPolicy::calculateLongPressMoveTolerance(30, 38);
+	const int largeItemTolerance =
+		ItemTouchPolicy::calculateLongPressMoveTolerance(60, 75);
+	ok = check(smallItemTolerance == 7,
+		"small item hint uses one quarter of its shorter edge") && ok;
+	ok = check(largeItemTolerance == 12,
+		"large item hint caps movement tolerance at 12 pixels") && ok;
+	ok = check(ItemTouchPolicy::isWithinLongPressMoveTolerance(
+		smallItemTolerance, 0, smallItemTolerance),
+		"item hint keeps a touch exactly at its movement tolerance") && ok;
+	ok = check(!ItemTouchPolicy::isWithinLongPressMoveTolerance(
+		smallItemTolerance + 1, 0, smallItemTolerance),
+		"item hint rejects movement beyond its tolerance") && ok;
+	ok = check(!ItemTouchPolicy::isWithinLongPressMoveTolerance(
+		50000, 50000, smallItemTolerance),
+		"large item-hint movement does not overflow into the tolerance") && ok;
+
+	ok = check(!shouldUseMobileRightScript(MOBILE_RIGHT_SCRIPT_LONG_PRESS_MS - 1, 0, 0),
+		"short touch keeps primary script") && ok;
+	ok = check(shouldUseMobileRightScript(MOBILE_RIGHT_SCRIPT_LONG_PRESS_MS, 0, 0),
+		"long press without movement uses right script") && ok;
+	ok = check(shouldUseMobileRightScript(MOBILE_RIGHT_SCRIPT_LONG_PRESS_MS, MOBILE_RIGHT_SCRIPT_MOVE_TOLERANCE_PIXELS, 0),
+		"movement exactly at tolerance still uses right script") && ok;
+	ok = check(!shouldUseMobileRightScript(MOBILE_RIGHT_SCRIPT_LONG_PRESS_MS, MOBILE_RIGHT_SCRIPT_MOVE_TOLERANCE_PIXELS + 1, 0),
+		"movement beyond tolerance keeps primary script") && ok;
+	ok = check(!shouldUseMobileRightScript(MOBILE_RIGHT_SCRIPT_LONG_PRESS_MS, 50000, 50000),
+		"large movement does not overflow into right-script selection") && ok;
+
+	ok = check(!isMobileJoystickDirectionActive(0, 4, 100),
+		"mobile joystick ignores movement inside the dead zone") && ok;
+	ok = check(isMobileJoystickDirectionActive(0, 5, 100),
+		"mobile joystick direction activates at the current dead-zone edge") && ok;
+	std::optional<uint64_t> runExitCandidateBeginTime;
+	MobileJoystickMovementState movementState = MobileJoystickMovementState::Idle;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 13, 240, 0, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Walk,
+		"mobile joystick starts walking beyond the dead zone") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 41, 240, 0, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Walk,
+		"mobile joystick stays walking below the run-entry threshold") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 42, 240, 0, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run,
+		"mobile joystick enters running above the upper hysteresis threshold") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 31, 240, 0, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run,
+		"mobile joystick stays running above the run-exit threshold") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 30, 240, 1000, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run,
+		"mobile joystick starts the run-exit delay in the walk zone") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 30, 240, 1299, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run,
+		"mobile joystick keeps running before the run-exit delay elapses") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 31, 240, 1299, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run
+		&& !runExitCandidateBeginTime.has_value(),
+		"mobile joystick cancels the run-exit delay above the exit threshold") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 30, 240, 1300, runExitCandidateBeginTime);
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 30, 240, 1600, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Walk,
+		"mobile joystick exits running after 300 ms in the walk zone") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 42, 240, 1600, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Run,
+		"mobile joystick re-enters running without a delay") && ok;
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 30, 240, 1700, runExitCandidateBeginTime);
+	movementState = getMobileJoystickMovementState(
+		movementState, 0, 12, 240, 1701, runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Idle,
+		"mobile joystick returns to idle immediately at the dead-zone edge") && ok;
+	movementState = getMobileJoystickMovementState(
+		MobileJoystickMovementState::Run, 0, 20, 0, 1800,
+		runExitCandidateBeginTime);
+	ok = check(movementState == MobileJoystickMovementState::Idle
+		&& !runExitCandidateBeginTime.has_value(),
+		"mobile joystick invalid range resets movement state") && ok;
+	ok = check(!isMobileJoystickDirectionActive(0, 20, 0),
+		"mobile joystick ignores invalid range") && ok;
+
+	ok = checkDirectionList(getMobileJoystickDirectionCandidates(0, 15, 100), { 0, 1, 7 },
+		"mobile joystick keeps current down direction candidate order") && ok;
+	ok = checkDirectionList(getMobileJoystickDirectionCandidates(-20, 0, 100), { 2, 3, 1 },
+		"mobile joystick keeps current left direction candidate order") && ok;
+	ok = checkDirectionList(getMobileJoystickDirectionCandidates(0, -20, 100), { 4, 5, 3 },
+		"mobile joystick keeps current up direction candidate order") && ok;
+	ok = checkDirectionList(getMobileJoystickDirectionCandidates(20, 0, 100), { 6, 7, 5 },
+		"mobile joystick keeps current right direction candidate order") && ok;
+	ok = checkDirectionList(getMobileJoystickDirectionCandidates(4, 0, 100), {},
+		"mobile joystick direction list is empty inside the dead zone") && ok;
+
+	ok = check(shouldUseRunForPlayerMoveIntent(false, 1, true, true),
+		"WalkIsRun promotes a walk intent when running is available") && ok;
+	ok = check(!shouldUseRunForPlayerMoveIntent(false, 0, true, true),
+		"disabled WalkIsRun keeps the original walk intent") && ok;
+	ok = check(shouldUseRunForPlayerMoveIntent(true, 0, true, true),
+		"an explicit run intent remains running when available") && ok;
+	ok = check(!shouldUseRunForPlayerMoveIntent(false, 1, false, true),
+		"CanRun=0 keeps WalkIsRun movement as a walk intent") && ok;
+	ok = check(!shouldUseRunForPlayerMoveIntent(true, 1, false, true),
+		"CanRun=0 downgrades an explicit run intent to walking") && ok;
+	ok = check(!shouldUseRunForPlayerMoveIntent(false, 1, true, false),
+		"insufficient thew keeps WalkIsRun movement as walking") && ok;
+	ok = check(!shouldUseRunForPlayerMoveIntent(true, 0, true, false),
+		"insufficient thew downgrades an explicit run intent to walking") && ok;
+
+	return ok ? 0 : 1;
+}

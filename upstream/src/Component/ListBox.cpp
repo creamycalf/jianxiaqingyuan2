@@ -1,0 +1,133 @@
+#include "ListBox.h"
+#include "../Engine/Engine.h"
+#include "../libconvert/libconvert.h"
+#include "ComponentRegistry.h"
+
+namespace
+{
+	bool registeredListBox = []
+	{
+		ComponentRegistry::getInstance().registerType("ListBox",
+			[]() -> std::shared_ptr<BaseComponent> { return std::make_shared<ListBox>(); });
+		return true;
+	}();
+}
+
+
+ListBox::ListBox()
+{
+	coverMouse = true;
+	setPriority(epButton);
+}
+
+
+ListBox::~ListBox()
+{
+	freeResource();
+}
+
+void ListBox::initFromIni(INIReader & ini)
+{
+	freeResource();
+
+	rect.x = ini.GetInteger("Init", "Left", rect.x);
+	rect.y = ini.GetInteger("Init", "Top", rect.y);
+	rect.w = ini.GetInteger("Init", "Width", rect.w);
+	rect.h = ini.GetInteger("Init", "Height", rect.h);
+	soundName = ini.Get("Init", "Sound", "");
+	itemHeight = ini.GetInteger("Init", "ItemHeight", itemHeight);
+	itemCount = ini.GetInteger("Init", "ItemCount", itemCount);
+	fitItems = ini.GetBoolean("Init", "FitItems", false);
+	
+	std::string soundName = ini.Get("Init", "Sound", "");
+
+	selColor = ini.GetColor("Init", "SelColor", color);
+	color = ini.GetColor("Init", "Color", color);	
+
+
+	if (itemCount > 0)
+	{
+		itemName.resize(itemCount);
+		itemButton.resize(itemCount);
+		
+		
+		for (size_t i = 0; i < itemName.size(); i++)
+		{
+			itemButton[i] = std::make_shared<Button>();
+			itemName[i] = ini.Get("Items", convert::formatString("%d", i + 1), "");
+			
+			itemButton[i]->loadSound(soundName, 1);
+			
+			itemButton[i]->image[0] = IMP::createIMPImageFromImage(engine->createText(itemName[i], itemSize, color));
+			itemButton[i]->rect = {rect.x, rect.y + ((int)i) * itemHeight, rect.w, itemHeight};
+			addChild(itemButton[i]);
+		}
+	}
+}
+
+void ListBox::updateItemButtonRect()
+{
+	if (fitItems && itemCount > 0) itemHeight = rect.h / itemCount;
+	for (size_t i = 0; i < itemButton.size(); i++)
+	{
+		if (itemButton[i])
+		{
+			itemButton[i]->rect = {rect.x, rect.y + ((int)i) * itemHeight, rect.w, itemHeight};
+		}
+	}
+}
+
+bool ListBox::setSelectedIndex(int selectedIndex)
+{
+	if (selectedIndex < 0 || selectedIndex >= static_cast<int>(itemButton.size())
+		|| selectedIndex >= static_cast<int>(itemName.size())
+		|| itemButton[selectedIndex] == nullptr)
+	{
+		return false;
+	}
+	if (index == selectedIndex)
+	{
+		return true;
+	}
+	if (index >= 0 && index < static_cast<int>(itemButton.size())
+		&& index < static_cast<int>(itemName.size()) && itemButton[index] != nullptr)
+	{
+		itemButton[index]->image[0] = IMP::createIMPImageFromImage(
+			engine->createText(itemName[index], itemSize, color));
+	}
+	index = selectedIndex;
+	itemButton[index]->image[0] = IMP::createIMPImageFromImage(
+		engine->createText(itemName[index], itemSize, selColor));
+	return true;
+}
+
+void ListBox::freeResource()
+{
+	index = -1;
+	for (int i = 0; i < (int)itemButton.size(); i++)
+	{
+		if (itemButton[i] != nullptr)
+		{
+			itemButton[i] = nullptr;
+		}	
+	}
+	itemButton.resize(0);
+	itemName.resize(0);
+	removeAllChild();
+}
+
+void ListBox::onEvent()
+{
+	for (std::size_t i = 0; i < itemButton.size(); i++)
+	{
+		if (itemButton[i] != nullptr && itemButton[i]->getResult(erMouseLDown))
+		{
+			setSelectedIndex(static_cast<int>(i));
+		}
+	}
+}
+
+void ListBox::onSetChildRect()
+{
+	updateItemButtonRect();
+}

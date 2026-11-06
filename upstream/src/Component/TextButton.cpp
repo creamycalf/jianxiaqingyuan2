@@ -1,0 +1,110 @@
+#include "TextButton.h"
+#include "../libconvert/libconvert.h"
+#include "ComponentRegistry.h"
+
+namespace
+{
+	bool registeredTextButton = []
+	{
+		ComponentRegistry::getInstance().registerType("TextButton",
+			[]() -> std::shared_ptr<BaseComponent> { return std::make_shared<TextButton>(); });
+		return true;
+	}();
+}
+
+TextButton::TextButton()
+{
+	name = "textbutton";
+	setPriority(epButton);
+	elementType = etButton;
+	result = erNone;
+    stretch = true;
+}
+
+TextButton::~TextButton()
+{
+	
+}
+
+void TextButton::setFontSize(int fontSize)
+{
+	label.fontSize = fontSize;
+}
+
+int TextButton::getFontSize() const
+{
+	return label.fontSize;
+}
+
+void TextButton::setStrColor(unsigned int color)
+{
+	label.color = color;
+}
+
+unsigned int TextButton::getTextColor() const
+{
+	return label.color;
+}
+
+void TextButton::setStr(const std::string& s)
+{
+	auto temps = s;
+	if (convert::GetUtf8LetterCount(s.c_str()) > (int)rect.w / label.fontSize)
+	{
+		//substr(0, rect.w / label.fontSize);
+		auto temp_list = convert::splitString(s, convert_max(rect.w / label.fontSize, 1));
+		if (temp_list.size() > 0)
+		{
+			temps = temp_list[0];
+		}
+	}
+    label.setStr(s);
+}
+
+void TextButton::setUTF8Str(const std::string& s)
+{
+	setStr(s);
+}
+
+void TextButton::initFromIni(INIReader & ini)
+{
+	Button::initFromIni(ini);
+	label.fontSize = ini.GetInteger("Init", "Font", label.fontSize);
+	label.color = ini.GetColor("Init", "Color", label.color);
+	setUTF8Str(ini.Get("Init", "Text", ""));
+}
+
+void TextButton::onDraw()
+{
+	Button::onDraw();
+	label.rect = rect;
+    label.rect.y += (rect.h - label.fontSize) / 2;
+	auto str = label.getStr();
+	label.rect.x += (rect.w - (convert::GetUtf8LetterCount(str.c_str()) * label.fontSize)) / 2;
+	label.onDraw();
+}
+
+void TextButton::onMouseLeftDown(int x, int y)
+{
+	playSound(1);
+    if (parent != nullptr && parent->canCallBack)
+    {
+        result = erMouseLDown;
+        parent->onChildCallBack(getMySharedPtr());
+        result = erNone;
+    }
+}
+
+void TextButton::onClick()
+{
+	if (parent != nullptr && parent->canCallBack)
+	{
+		result = erClick;
+		parent->onChildCallBack(getMySharedPtr());
+		result = erNone;
+	}
+	else
+	{
+		result |= erClick;
+	}
+}

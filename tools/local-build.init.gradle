@@ -1,0 +1,14 @@
+gradle.beforeProject { p ->
+    if (p.path == ':app') {
+        p.pluginManager.withPlugin('com.android.application') {
+            p.extensions.getByName('androidComponents').finalizeDsl { dsl ->
+                dsl.ndkVersion = '29.0.13113456'
+                dsl.externalNativeBuild.cmake.version = '3.31.6'
+                def assets = p.file(p.providers.gradleProperty('jxqyAssetsDir').get())
+                ['debug', 'fullyRelease'].each { variant ->
+                    dsl.sourceSets.getByName(variant).assets.setSrcDirs([assets])
+                }
+            }
+        }
+    }
+}

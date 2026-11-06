@@ -1,0 +1,78 @@
+#include "MemoText.h"
+#include "ComponentRegistry.h"
+
+namespace
+{
+	bool registeredMemoText = []
+	{
+		ComponentRegistry::getInstance().registerType("MemoText",
+			[]() -> std::shared_ptr<BaseComponent> { return std::make_shared<MemoText>(); });
+		return true;
+	}();
+}
+
+
+MemoText::MemoText()
+{
+	setPriority(epMenu);
+	name = "Memo";
+	elementType = etMenu;
+	canDrag = true;
+}
+
+MemoText::~MemoText()
+{
+	freeResource();
+}
+
+void MemoText::initFromIni(INIReader & ini)
+{
+	freeResource();
+	mstr.resize(MEMO_LINE);
+	for (size_t i = 0; i < MEMO_LINE; i++)
+	{
+		mstr[i] = std::make_shared<Label>();
+		addChild(mstr[i]);
+	}
+
+	rect.x = ini.GetInteger("Init", "Left", rect.x);
+	rect.y = ini.GetInteger("Init", "Top", rect.y);
+	rect.w = ini.GetInteger("Init", "Width", rect.w);
+	rect.h = ini.GetInteger("Init", "Height", rect.h);
+	name = ini.Get("Init", "Name", name);
+	fontSize = ini.GetInteger("Init", "Font", fontSize);
+	lineSize = ini.GetInteger("Init", "LineSize", lineSize);
+	fitLines = ini.GetBoolean("Init", "FitLines", false);
+	color = ini.GetColor("Init", "Color", color);
+	for (size_t i = 0; i < MEMO_LINE; i++)
+	{
+		mstr[i]->rect.x = 0;
+		mstr[i]->rect.y = i * lineSize;
+		mstr[i]->rect.w = rect.w;
+		mstr[i]->rect.h = lineSize;
+		mstr[i]->fontSize = fontSize;
+		mstr[i]->color = color;
+		mstr[i]->autoShrink = fitLines;
+		mstr[i]->minimumFontSize = 12;
+	}
+}
+
+void MemoText::onSetChildRect()
+{
+	if (!fitLines) return;
+	const int rowHeight = rect.h / MEMO_LINE;
+	for (size_t i = 0; i < mstr.size(); ++i)
+	{
+		mstr[i]->rect = { rect.x, rect.y + static_cast<int>(i) * rowHeight, rect.w, rowHeight };
+	}
+}
+
+void MemoText::freeResource()
+{
+	for (size_t i = 0; i < mstr.size(); i++)
+	{
+		mstr[i] = nullptr;
+	}
+	mstr.resize(0);
+	removeAllChild();
+}

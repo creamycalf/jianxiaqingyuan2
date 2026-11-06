@@ -1,0 +1,217 @@
+#pragma once
+
+#include "HttpsDownload.h"
+#include "ResourceDownloadPlanner.h"
+#include "ResourcePackageArchive.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace OnlineUpdate
+{
+enum class ResourceDownloadPreparationStatus
+{
+	Success,
+	InvalidInput,
+	PlanFailed,
+	InvalidArtifactUrl,
+	WorkspaceAlreadyExists,
+	WorkspaceUnavailable,
+	Cancelled,
+	DownloadFailed,
+	ProgramNotAvailable,
+	ArtifactValidationFailed,
+	PackageValidationFailed,
+	CleanupFailed
+};
+
+struct ResourceDownloadPreparationProgress
+{
+	enum class Stage
+	{
+		Downloading,
+		ValidatingAndExtracting
+	};
+
+	std::size_t packageIndex = 0;
+	std::size_t packageCount = 0;
+	std::string gameId;
+	std::uint64_t packageTransferredBytes = 0;
+	std::uint64_t completedBytes = 0;
+	std::uint64_t totalBytes = 0;
+	Stage stage = Stage::Downloading;
+};
+
+using ResourceDownloadPreparationProgressCallback =
+	std::function<bool(const ResourceDownloadPreparationProgress& progress)>;
+
+using ResourceArtifactDownloadFunction = std::function<HttpsDownloadResult(
+	const std::string& url,
+	const std::filesystem::path& destinationPath,
+	std::uint64_t maximumBytes,
+	std::uint64_t expectedBytes,
+	const HttpsDownloadProgress& progress)>;
+
+using CatalogDownloadFunction = std::function<HttpsBufferDownloadResult(
+	const std::string& url,
+	std::size_t maximumBytes,
+	const HttpsDownloadProgress& progress)>;
+
+struct CatalogMirrorSources
+{
+	// The first URL supplied the selected catalog. Later candidates must return
+	// catalogBytes exactly before their relative artifacts may be used.
+	std::vector<std::string> catalogUrls;
+	std::vector<char> catalogBytes;
+};
+
+struct CatalogMirrorSelectionResult
+{
+	bool configured = false;
+	bool downloadAttempted = false;
+	CatalogMirrorSources sources;
+	HttpsBufferDownloadResult download;
+	CatalogParseResult parse;
+
+	bool succeeded() const noexcept
+	{
+		return configured && !sources.catalogUrls.empty() &&
+			download.succeeded() && parse.succeeded();
+	}
+};
+
+// Stops after the first valid catalog. Remaining URLs are checked lazily only
+// if an artifact needs a fallback, so a healthy primary does not wait for a
+// failed secondary catalog.
+CatalogMirrorSelectionResult selectCatalogMirrorSources(
+	const std::vector<std::string>& catalogUrls,
+	const HttpsDownloadProgress& progress = {},
+	const CatalogDownloadFunction& catalogDownloader = {});
+
+using InstalledResourceRootMap =
+	std::map<std::string, std::filesystem::path>;
+
+struct PreparedResourceDownload
+{
+	ResourcePackage package;
+	ResourceDownloadPlan::ArtifactKind artifactKind =
+		ResourceDownloadPlan::ArtifactKind::Full;
+	std::filesystem::path archivePath;
+	std::filesystem::path preparedResourcePath;
+};
+
+struct ResourceDownloadPreparationResult
+{
+	ResourceDownloadPreparationStatus status =
+		ResourceDownloadPreparationStatus::InvalidInput;
+	ResourcePlanStatus planStatus = ResourcePlanStatus::Ready;
+	std::string failedGameId;
+	std::filesystem::path workspacePath;
+	HttpsDownloadResult downloadResult;
+	ResourcePackageArchiveResult packageResult;
+	std::vector<PreparedResourceDownload> preparedResources;
+	std::uint64_t totalDownloadBytes = 0;
+
+	bool succeeded() const noexcept
+	{
+		return status == ResourceDownloadPreparationStatus::Success;
+	}
+};
+
+struct CommonDownloadPreparationResult
+{
+	ResourceDownloadPreparationStatus status =
+		ResourceDownloadPreparationStatus::InvalidInput;
+	std::filesystem::path workspacePath;
+	HttpsDownloadResult downloadResult;
+	ResourcePackageArchiveResult packageResult;
+	CommonPackage package;
+	std::filesystem::path archivePath;
+	std::filesystem::path preparedCommonPath;
+
+	bool succeeded() const noexcept
+	{
+		return status == ResourceDownloadPreparationStatus::Success;
+	}
+};
+
+struct ProgramDownloadPreparationResult
+{
+	ResourceDownloadPreparationStatus status =
+		ResourceDownloadPreparationStatus::InvalidInput;
+	ProgramUpdateStatus updateStatus = ProgramUpdateStatus::InvalidInput;
+	std::filesystem::path workspacePath;
+	std::filesystem::path artifactPath;
+	HttpsDownloadResult downloadResult;
+	ProgramPackage package;
+
+	bool succeeded() const noexcept
+	{
+		return status == ResourceDownloadPreparationStatus::Success;
+	}
+};
+
+// Downloads and validates the needed members of one online dependency closure
+// into a new private workspace. The workspace must not exist. Any failure
+// removes only the workspace created by this call; installed resources are
+// never modified. A fallback catalog must match the selected catalog bytes;
+// retryable transfer or artifact-validation failures advance to the next URL.
+ResourceDownloadPreparationResult prepareResourceDownload(
+	const Catalog& catalog,
+	const std::string& requestedGameId,
+	const std::string& currentEngineVersion,
+	const CatalogMirrorSources& catalogSources,
+	const std::filesystem::path& workspacePath,
+	const InstalledResourceArtifactMap& installedArtifacts,
+	const InstalledResourceRootMap& installedResourceRoots,
+	RequestedResourceDownloadMode requestedMode,
+	const ResourceDownloadPreparationProgressCallback& progress = {},
+	const ResourceArtifactDownloadFunction& artifactDownloader = {},
+	const CatalogDownloadFunction& catalogDownloader = {},
+	const std::filesystem::path& partialDownloadDirectory = {});
+
+// Downloads and validates the optional catalog [Common] package into a new
+// private workspace. It never replaces the installed assets/common directory.
+CommonDownloadPreparationResult prepareCommonDownload(
+	const Catalog& catalog,
+	const CatalogMirrorSources& catalogSources,
+	const std::filesystem::path& workspacePath,
+	const ResourceDownloadPreparationProgressCallback& progress = {},
+	const ResourceArtifactDownloadFunction& artifactDownloader = {},
+	const CatalogDownloadFunction& catalogDownloader = {},
+	const std::filesystem::path& partialDownloadDirectory = {});
+
+// Catalog-scoped partial paths and complete artifact sizes for this plan.
+// Includes requested resources, dependencies, selected increments and common.
+std::map<std::filesystem::path, std::uint64_t> resourceDownloadPartialFiles(
+	const ResourceDownloadPlan& plan,
+	const CommonPackage* common,
+	const std::filesystem::path& partialDownloadDirectory);
+
+// Remaining ZIP bytes for the existing disk-space preflight. Only matching
+// catalog artifacts in the private partial directory count as downloaded.
+std::uint64_t remainingResourceDownloadBytes(
+	const ResourceDownloadPlan& plan,
+	const CommonPackage* common,
+	const std::filesystem::path& partialDownloadDirectory);
+
+// Downloads the selected platform's sole online program artifact into a new
+// private workspace. The public semantic Version is comparison information
+// only and never selects a different online artifact. This validates catalog
+// size and CRC32 but never starts an installer or changes the current program
+// directory.
+ProgramDownloadPreparationResult prepareProgramDownload(
+	const Catalog& catalog,
+	const std::string& target,
+	const std::string& currentVersion,
+	const CatalogMirrorSources& catalogSources,
+	const std::filesystem::path& workspacePath,
+	const HttpsDownloadProgress& progress = {},
+	const ResourceArtifactDownloadFunction& artifactDownloader = {},
+	const CatalogDownloadFunction& catalogDownloader = {});
+}

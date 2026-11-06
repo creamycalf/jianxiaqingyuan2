@@ -1,0 +1,1410 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Src">
+      <UniqueIdentifier>{10534a4c-2ff5-4153-90fd-9fc34a162000}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Component">
+      <UniqueIdentifier>{de7e3e22-b313-4734-84a3-98921fdc89bb}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Element">
+      <UniqueIdentifier>{53ea41b6-de3f-4408-940b-b6560771204d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Engine">
+      <UniqueIdentifier>{a4cfe0ef-e229-4e13-9c1d-4a12a90d8580}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Input">
+      <UniqueIdentifier>{0b1ef38c-7c61-4b4a-9ea7-a0325d277b64}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\File">
+      <UniqueIdentifier>{afb1da7c-2ab3-4eea-9e57-ced57fe279b4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Launch">
+      <UniqueIdentifier>{2edbab72-cc7e-4c1f-8cd1-c5780bff2af6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game">
+      <UniqueIdentifier>{bb494344-909f-4039-a910-9fc67a2bcce2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Image">
+      <UniqueIdentifier>{f90eff5b-db2a-4543-bcd4-83ac352eee6b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\libconvert">
+      <UniqueIdentifier>{7fc82961-aaa8-4cc5-a045-0a60c34bb231}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Types">
+      <UniqueIdentifier>{522d150f-5061-4fe5-8fc1-606e59ad6387}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Weather">
+      <UniqueIdentifier>{56ef8b08-4c6d-4bc3-b666-9bc6c14a74a6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Config">
+      <UniqueIdentifier>{9b8651a6-114c-48ce-a335-b6e15cd04776}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Data">
+      <UniqueIdentifier>{ec504f17-877f-40ae-93bb-2e05953afbda}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\GameManager">
+      <UniqueIdentifier>{cbf3400e-1d6b-4999-a929-93ad4df04984}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Loading">
+      <UniqueIdentifier>{38d85be8-2c05-4ea3-bd0b-47dd4a17e2d4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Menu">
+      <UniqueIdentifier>{af894b4b-0d3b-4adb-ad96-954b2c75875e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Scene">
+      <UniqueIdentifier>{fa86070c-501e-42b9-9ec3-af9339254fba}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Script">
+      <UniqueIdentifier>{67303860-df54-4d57-9f26-e73cb0420b37}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ThirdParty">
+      <UniqueIdentifier>{e5438447-67ae-45da-9da5-526af413ac20}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ThirdParty\lua">
+      <UniqueIdentifier>{4ffd85ef-8d83-4056-9e50-242274aff172}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ThirdParty\miniLZO">
+      <UniqueIdentifier>{8808592d-0f65-45ef-8d73-dcb510cc534c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ThirdParty\miniz">
+      <UniqueIdentifier>{a73f7bb4-cb4b-42d0-9d8d-dc42bd6fd9cc}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Game\Data\NPCAction">
+      <UniqueIdentifier>{521399bf-c28a-4c58-8906-75634fe5869e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Resource">
+      <UniqueIdentifier>{ceae5301-7a1b-482d-aa6e-183a28e0c285}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Update">
+      <UniqueIdentifier>{90a70173-5475-4b90-970d-40e47d082910}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Src\Platform">
+      <UniqueIdentifier>{a1b2c3d4-e5f6-7890-abcd-ef1234567890}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\src\main.cpp">
+      <Filter>Src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Button.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\CheckBox.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ColumnImage.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\DragButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\DragRoundButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\FadeMask.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ImageContainer.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Item.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Joystick.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Label.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ListBox.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\MemoText.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Panel.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\RoundButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\Scrollbar.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\FlatScrollbar.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\FlatTextButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\TalkLabel.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\TextButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\TransImage.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\VideoPlayer.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Element\Element.cpp">
+      <Filter>Src\Element</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Engine\Engine.cpp">
+      <Filter>Src\Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Engine\AspectFitLayout.cpp">
+      <Filter>Src\Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Engine\EngineBase.cpp">
+      <Filter>Src\Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Engine\ImageTypes.cpp">
+      <Filter>Src\Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Engine\Timer.cpp">
+      <Filter>Src\Engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Input\PhysicalInputManager.cpp">
+      <Filter>Src\Input</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\File.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\RootedResourceReader.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\StrictRelativeResourcePath.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunDescriptor.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunDiagnostics.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunDiagnosticsFile.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunOrchestration.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunOrchestrationProduction.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunResourceRouting.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunRuntimeSession.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunRuntimeTrace.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunRuntimeTraceFile.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\GameplayAutomation\AutomationPipe.cpp">
+      <Filter>Src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\GameplayAutomation\GameplayAutomationSession.cpp">
+      <Filter>Src</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunRuntimeTraceWriter.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\EditorRunSceneApplication.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Launch\GameLaunchArguments.cpp">
+      <Filter>Src\Launch</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\ini.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\INIReader.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Game.cpp">
+      <Filter>Src\Game</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Config\Config.cpp">
+      <Filter>Src\Game\Config</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\CollisionDetector.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\ColorStyle.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Effect.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\EffectManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\GameElement.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\AttributePoints.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\SkillTree.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Global.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Goods.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\GoodsManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Magic.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MagicManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Map.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Memo.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MemoPersistence.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPC.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Object.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\ObjectManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\PartnerManager.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Player.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Traps.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\VariableList.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\Camera.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\GameController.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\GameManager.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\RuntimeSaveGenerationPolicy.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\SaveGeneration.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\WorldInteractionResolver.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\MenuController.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\SaveFileManager.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\SavePackage.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Loading\ExclusiveLoadingRunner.cpp">
+      <Filter>Src\Game\Loading</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\BottomMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\TopMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\BuySellMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ColumnMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ControllerTransferCoordinator.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ControllerTransferPolicies.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\Dialog.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\EquipMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\GoodsMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\JoystickPanel.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\MagicMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\MemoMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\MsgBox.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\Option.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\PracticeMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\SaveLoad.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\SkillsPanel.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\SlotGridController.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\StateMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\System.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ControllerHelpOverlay.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ControllerPromptPresenter.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\SystemNotice.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ToolTip.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\UIFocusManager.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\YesNo.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Scene\MainScene.cpp">
+      <Filter>Src\Game\Scene</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Scene\Nurturance.cpp">
+      <Filter>Src\Game\Scene</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Scene\Title.cpp">
+      <Filter>Src\Game\Scene</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Scene\TitleTeam.cpp">
+      <Filter>Src\Game\Scene</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Scene\VideoPage.cpp">
+      <Filter>Src\Game\Scene</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Script\Script.cpp">
+      <Filter>Src\Game\Script</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Image\IMP.cpp">
+      <Filter>Src\Image</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\libconvert\libconvert.cpp">
+      <Filter>Src\libconvert</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Weather\Weather.cpp">
+      <Filter>Src\Weather</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\File\log.cpp">
+      <Filter>Src\File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\BaseComponent.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lapi.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lauxlib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lbaselib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lcode.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lcorolib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lctype.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ldblib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ldebug.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ldo.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ldump.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lfunc.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lgc.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\linit.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\liolib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\llex.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lmathlib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lmem.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\loadlib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lobject.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lopcodes.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\loslib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lparser.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lstate.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lstring.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lstrlib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ltable.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ltablib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ltests.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\ltm.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lundump.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lutf8lib.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lvm.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\lua\lzio.c">
+      <Filter>ThirdParty\lua</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\minilzo\minilzo.c">
+      <Filter>ThirdParty\miniLZO</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\WaterEffect.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionAttack.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionBase.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionDeath.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionHide.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionHurt.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionJump.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionMagic.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionManager.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionRun.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionSit.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionSpecial.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionStand.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionWalk.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Script\ScriptAPI.cpp">
+      <Filter>Src\Game\Script</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ChooseMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\TimerMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ChooseTextButton.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ComponentRegistry.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\ConfigDrivenPanel.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Image\PicDecoder.cpp">
+      <Filter>Src\Image</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\MapThumbnailMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\NpcInfoPanel.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Platform\AndroidExternalStorage.cpp">
+      <Filter>Src\Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Platform\AndroidProgramUpdate.cpp">
+      <Filter>Src\Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Platform\MobileNetwork.cpp">
+      <Filter>Src\Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourceManager.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourceCatalog.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourceManifest.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ModReleaseAssets.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ModReleaseMetadata.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\SemanticVersion.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourcePackCard.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourcePackList.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourceSelectScene.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Resource\ResourceSelectSceneSaveTransfer.cpp">
+      <Filter>Src\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\OnlineUpdateCatalog.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\HttpsDownload.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\ResourcePackageArchive.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\ResourceDownloadPlanner.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\ResourceDownloadPreparation.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\ResourceInstallTransaction.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Update\ArtifactChecksum.cpp">
+      <Filter>Src\Update</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\miniz\miniz.c">
+      <Filter>ThirdParty\miniz</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\miniz\miniz_zip.c">
+      <Filter>ThirdParty\miniz</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\miniz\miniz_tinfl.c">
+      <Filter>ThirdParty\miniz</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ThirdParty\miniz\miniz_tdef.c">
+      <Filter>ThirdParty\miniz</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\AttributePointMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\PaperMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\SkillTreeMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\GambleMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\DiceGambleState.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\FishGameState.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\MinimapToggleButton.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\PartnerEquipMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\PartnerHeadMenu.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Component\TextLayout.cpp">
+      <Filter>Src\Component</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\BuySellInventory.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MagicBeginPosition.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NewYearPeriod.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MagicControl.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MagicRegionFile.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MagicTransport.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\MediaPathResolver.cpp">
+      <Filter>Src\Game\Data</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionBounce.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Data\NPCAction\NPCActionMagicForcedMove.cpp">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\GameManager\ScriptRuntimeState.cpp">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ChooseMenuLayout.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\Game\Menu\ChooseMultipleSelection.cpp">
+      <Filter>Src\Game\Menu</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\src\Component\BaseComponent.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Button.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\CheckBox.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ColumnImage.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Component.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\DragButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\DragRoundButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\FadeMask.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ImageContainer.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Item.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Joystick.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Label.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ListBox.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\MemoText.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Panel.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\RoundButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\Scrollbar.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\FlatComponentPolicy.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\FlatScrollbar.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\FlatTextButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\TalkLabel.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\TextButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\TransImage.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\VideoPlayer.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Element\Element.h">
+      <Filter>Src\Element</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\Engine.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\AspectFitLayout.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\EngineBase.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\ImageTypes.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\MediaTypes.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\Timer.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Engine\WindowTypes.h">
+      <Filter>Src\Engine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Input\InputAction.h">
+      <Filter>Src\Input</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Input\PhysicalInputManager.h">
+      <Filter>Src\Input</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Input\GamepadConnectionObserver.h">
+      <Filter>Src\Input</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\File\File.h">
+      <Filter>Src\File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\File\ini.h">
+      <Filter>Src\File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\File\INIReader.h">
+      <Filter>Src\File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunDescriptor.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunDiagnostics.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunDiagnosticsFile.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunOrchestration.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunResourceRouting.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunRuntimeSession.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunRuntimeTrace.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunRuntimeTraceFile.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunRuntimeTraceWriter.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\EditorRunSceneApplication.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Launch\GameLaunchArguments.h">
+      <Filter>Src\Launch</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Game.h">
+      <Filter>Src\Game</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameTypes.h">
+      <Filter>Src\Game</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Config\Config.h">
+      <Filter>Src\Game\Config</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Camera.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\CollisionDetector.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\ColorStyle.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Data.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\DefeatedNpcExperience.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Effect.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\EffectManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\GameElement.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\AttributePoints.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\SkillTree.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Global.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Goods.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\GoodsManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Magic.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\MagicManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Map.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Memo.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\MemoPersistence.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPC.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Object.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\ObjectManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\PartnerManager.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Player.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\Traps.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\VariableList.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\GameController.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\GameManager.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\WorldInteractionResolver.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\MenuController.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\SaveFileManager.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\GameManager\SavePackage.h">
+      <Filter>Src\Game\GameManager</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\BottomMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\TopMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\BuySellMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ColumnMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ControllerFocusParticipant.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ControllerTransferCoordinator.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ControllerTransferPolicies.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\Dialog.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\EquipMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\GoodsMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\JoystickPanel.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MagicMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MemoMemu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\Menu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MsgBox.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\Option.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\PracticeMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\SaveLoad.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\SkillsPanel.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\SlotGridController.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\StateMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\System.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\SystemNotice.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ControllerHelpOverlay.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ControllerPromptPresenter.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ToolTip.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\UIFocusManager.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\YesNo.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Scene\MainScene.h">
+      <Filter>Src\Game\Scene</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Scene\Nurturance.h">
+      <Filter>Src\Game\Scene</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Scene\Title.h">
+      <Filter>Src\Game\Scene</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Scene\TitleTeam.h">
+      <Filter>Src\Game\Scene</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Scene\VideoPage.h">
+      <Filter>Src\Game\Scene</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Script\Script.h">
+      <Filter>Src\Game\Script</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Image\IMP.h">
+      <Filter>Src\Image</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\libconvert\libconvert.h">
+      <Filter>Src\libconvert</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\CommonTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\PlatformDefinitions.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\ComponentTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\ElementTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\EventTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\ImagePackageFile.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\MapTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\Types.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Types\WeatherTypes.h">
+      <Filter>Src\Types</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Weather\Weather.h">
+      <Filter>Src\Weather</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\File\log.h">
+      <Filter>Src\File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lapi.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lauxlib.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lcode.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lctype.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ldebug.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ldo.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lfunc.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lgc.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ljumptab.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\llex.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\llimits.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lmem.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lobject.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lopcodes.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lopnames.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lparser.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lprefix.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lstate.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lstring.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ltable.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ltests.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\ltm.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lua.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\luaconf.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lualib.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lundump.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lvm.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ThirdParty\lua\lzio.h">
+      <Filter>ThirdParty\lua</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="..\..\src\Game\Data\WaterEffect.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionBase.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionAttack.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionDeath.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionHide.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionHurt.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionJump.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionMagic.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionManager.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionRun.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionSit.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionSpecial.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionType.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionStand.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NPCAction\NPCActionWalk.h">
+      <Filter>Src\Game\Data\NPCAction</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Script\ScriptAPI.h">
+      <Filter>Src\Game\Script</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\TalkTextList.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\ChooseMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\TimerMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ChooseTextButton.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ComponentRegistry.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Component\ConfigDrivenPanel.h">
+      <Filter>Src\Component</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Image\PicDecoder.h">
+      <Filter>Src\Image</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MapThumbnailMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\NpcInfoPanel.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourceCatalog.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Platform\AndroidExternalStorage.h">
+      <Filter>Src\Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Platform\AndroidProgramUpdate.h">
+      <Filter>Src\Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Platform\MobileNetwork.h">
+      <Filter>Src\Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourceManager.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourceManifest.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourcePackCard.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourcePackList.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Resource\ResourceSelectScene.h">
+      <Filter>Src\Resource</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\OnlineUpdateCatalog.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\HttpsDownload.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\ResourcePackageArchive.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\ResourceDownloadPlanner.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\ResourceDownloadPreparation.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\ResourceInstallTransaction.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Update\ArtifactChecksum.h">
+      <Filter>Src\Update</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\AttributePointMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\PaperMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\SkillTreeMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\GambleMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\DiceGambleState.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\FishGameState.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Data\NewYearPeriod.h">
+      <Filter>Src\Game\Data</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MenuResource.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\MinimapToggleButton.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\PartnerEquipMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\src\Game\Menu\PartnerHeadMenu.h">
+      <Filter>Src\Game\Menu</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="jxqy-all-in-one.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="..\..\assets\engine\config\logo.png">
+      <Filter>资源文件</Filter>
+    </Image>
+    <Image Include="jxqy.ico">
+      <Filter>资源文件</Filter>
+    </Image>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,45 @@
+#pragma once
+#include "RoundButton.h"
+#include "../Game/Data/MobileTouchInteraction.h"
+#include <vector>
+
+#define OutRange -1000
+
+class Joystick :
+	public RoundButton
+{
+public:
+	Joystick():RoundButton() {}
+	virtual ~Joystick() { freeResource(); }
+protected:
+	Point touchPosition = { OutRange, OutRange };
+private:
+	bool useStaticImages = false;
+	MobileJoystickMovementState movementState = MobileJoystickMovementState::Idle;
+	std::optional<uint64_t> runExitCandidateBeginTime;
+	void updateMovementState();
+public:
+	std::vector<int> getDirectionList();
+	bool isRunning();
+	bool isWalking();
+	int distanceToCenter();
+	void resetInput();
+protected:
+	virtual bool mouseInRect(int x, int y);
+	virtual bool shouldKeepTouchWhenPointerLeaves(int x, int y);
+	virtual bool onPointerInteractionCanceled(EventTouchID pointerID) override;
+	virtual void onAllPointerInteractionsCanceled() override;
+public:
+	virtual void onMouseMoving(int x, int y);
+	virtual void onMouseMoveIn(int x, int y);
+	virtual void onMouseMoveOut();
+	virtual void onMouseLeftUp(int x, int y);
+	virtual void onMouseLeftDown(int x, int y);
+	virtual void onClick() {}
+	virtual void onDraw();
+
+
+	void freeResource();
+public:
+	virtual void initFromIni(INIReader & ini);
+};

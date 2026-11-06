@@ -1,0 +1,4228 @@
+#include "../Game/Script/Script.h"
+#include "../Game/Script/ScriptNpcAction.h"
+#include "../Game/Config/Config.h"
+#include "../Game/Data/ColorStyle.h"
+#include "../Game/Data/Goods.h"
+#include "../Game/Data/Magic.h"
+#include "../Game/Data/Map.h"
+#include "../Game/Data/NPC.h"
+#include "../Game/Data/NPCManager.h"
+#include "../Game/Data/NPCAction/NPCActionManager.h"
+#include "../Game/GameManager/GameManager.h"
+#include "../Game/GameManager/GameController.h"
+#include "../Game/GameManager/ScriptRuntimeState.h"
+#include "../Element/Element.h"
+#include "../Engine/Engine.h"
+#include "../File/File.h"
+#include "../Image/IMP.h"
+#include "../Launch/EditorRunRuntimeTraceWriter.h"
+#include "../Resource/ResourceManifest.h"
+
+#include <cstring>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+class ScriptEngineRuntimeTestAccess
+{
+public:
+	static int execute(Script& script, const std::string& source)
+	{
+		auto data = std::make_unique<char[]>(source.size());
+		std::memcpy(data.get(), source.data(), source.size());
+		return script.runScript(data, static_cast<int>(source.size()));
+	}
+
+	static int stackTop(const Script& script)
+	{
+		return lua_gettop(script.luaState);
+	}
+
+	static int globalType(const Script& script, const char* name)
+	{
+		const int initialStackTop = lua_gettop(script.luaState);
+		const int type = lua_getglobal(script.luaState, name);
+		lua_settop(script.luaState, initialStackTop);
+		return type;
+	}
+
+	static int globalTableFieldType(
+		const Script& script,
+		const char* tableName,
+		const char* fieldName)
+	{
+		const int initialStackTop = lua_gettop(script.luaState);
+		int type = lua_getglobal(script.luaState, tableName);
+		if (type == LUA_TTABLE)
+		{
+			type = lua_getfield(script.luaState, -1, fieldName);
+		}
+		lua_settop(script.luaState, initialStackTop);
+		return type;
+	}
+
+	static int registryTableFieldType(
+		const Script& script,
+		const char* tableName,
+		const char* fieldName)
+	{
+		const int initialStackTop = lua_gettop(script.luaState);
+		int type = lua_getfield(script.luaState, LUA_REGISTRYINDEX, tableName);
+		if (type == LUA_TTABLE)
+		{
+			type = lua_getfield(script.luaState, -1, fieldName);
+		}
+		lua_settop(script.luaState, initialStackTop);
+		return type;
+	}
+
+	static bool globalMatchesRegistryTableField(
+		const Script& script,
+		const char* globalName,
+		const char* tableName,
+		const char* fieldName)
+	{
+		const int initialStackTop = lua_gettop(script.luaState);
+		lua_getglobal(script.luaState, globalName);
+		const int globalIndex = lua_absindex(script.luaState, -1);
+		bool matches = false;
+		if (lua_getfield(script.luaState, LUA_REGISTRYINDEX, tableName) ==
+			LUA_TTABLE)
+		{
+			lua_getfield(script.luaState, -1, fieldName);
+			matches = lua_rawequal(script.luaState, globalIndex, -1) != 0;
+		}
+		lua_settop(script.luaState, initialStackTop);
+		return matches;
+	}
+
+	static int globalTableEntryCount(
+		const Script& script,
+		const char* tableName)
+	{
+		const int initialStackTop = lua_gettop(script.luaState);
+		int count = -1;
+		if (lua_getglobal(script.luaState, tableName) == LUA_TTABLE)
+		{
+			count = 0;
+			const int tableIndex = lua_absindex(script.luaState, -1);
+			lua_pushnil(script.luaState);
+			while (lua_next(script.luaState, tableIndex) != 0)
+			{
+				++count;
+				lua_pop(script.luaState, 1);
+			}
+		}
+		lua_settop(script.luaState, initialStackTop);
+		return count;
+	}
+
+	static void registerNestedRunner(Script& script)
+	{
+		lua_pushlightuserdata(script.luaState, &script);
+		lua_pushcclosure(script.luaState, runNested, 1);
+		lua_setglobal(script.luaState, "test_run_nested");
+	}
+
+	static void registerQuitRequester(Script& script)
+	{
+		script.registerLuaFunction("test_request_application_quit", requestApplicationQuit);
+	}
+
+	static void registerPlayerDeathTrigger(Script& script)
+	{
+		script.registerLuaFunction("test_queue_player_death", [](lua_State*)
+		{
+			gm->varList.setInteger("ActiveBatchBlocksInput",
+				gm->scriptTaskList.empty() && gm->hasPendingTrapScript());
+			gm->player->result |= erRunDeathScript;
+			return 0;
+		});
+	}
+
+	static void registerTraceNestedRunner(Script& script)
+	{
+		lua_pushlightuserdata(script.luaState, &script);
+		lua_pushcclosure(
+			script.luaState,
+			runTraceNested,
+			1);
+		lua_setglobal(
+			script.luaState,
+			"test_run_trace_nested");
+	}
+
+	static bool nestedStackWasPreserved()
+	{
+		return nestedStackPreserved;
+	}
+
+	static bool nestedTraceRunningWasPreserved()
+	{
+		return nestedTraceRunningPreserved;
+	}
+
+	static void setCurrentBgmName(GameManager& gameManager, const std::string& name)
+	{
+		gameManager.bgmName = name;
+	}
+
+	static const std::string& currentBgmName(const GameManager& gameManager)
+	{
+		return gameManager.bgmName;
+	}
+
+	static bool isLogicRunning(const GameManager& gameManager)
+	{
+		return gameManager.logicRunning;
+	}
+
+	static bool runPendingPlayerDeathScript(GameManager& gameManager)
+	{
+		return gameManager.runPendingPlayerDeathScript();
+	}
+
+	static void updateGameManager(GameManager& gameManager)
+	{
+		gameManager.onUpdate();
+	}
+
+	static void advanceGameManager(GameManager& gameManager, UTime milliseconds)
+	{
+		gameManager.frameTime = milliseconds;
+		gameManager.onUpdate();
+	}
+
+	static void registerScriptProbe(Script& script, const char* name, lua_CFunction callback)
+	{
+		script.registerLuaFunction(name, callback);
+	}
+
+private:
+	static int runNested(lua_State* luaState)
+	{
+		auto* script = static_cast<Script*>(lua_touserdata(luaState, lua_upvalueindex(1)));
+		const int initialStackTop = lua_gettop(luaState);
+		const int result = execute(*script, "return 'nested-result'");
+		nestedStackPreserved = result == LUA_OK && lua_gettop(luaState) == initialStackTop;
+		lua_pushinteger(luaState, initialStackTop);
+		return 1;
+	}
+
+	static int runTraceNested(lua_State* luaState)
+	{
+		auto* script = static_cast<Script*>(
+			lua_touserdata(
+				luaState,
+				lua_upvalueindex(1)));
+		const bool runningBefore = script->running;
+		ResolvedTraceScriptSource source;
+		const std::string nestedSource =
+			"printf('nested trace')\n";
+		source.bytes.assign(
+			nestedSource.begin(),
+			nestedSource.end());
+		source.identity.virtualPath =
+			"script/common/nested.lua";
+		source.identity.rootKind =
+			EditorRun::RuntimeTraceRootKind::Active;
+		source.identity.rootOrdinal = 0;
+		source.identity.resourcePackId = "test-pack";
+		source.identity.sourceLayer =
+			EditorRun::RuntimeTraceSourceLayer::Formal;
+		const ExactScriptExecutionResult result =
+			script->runResolvedTraceScriptSource(
+				std::move(source));
+		nestedTraceRunningPreserved =
+			runningBefore &&
+			script->running &&
+			result.succeeded();
+		return 0;
+	}
+
+	static int requestApplicationQuit(lua_State*)
+	{
+		Engine::getInstance()->requestApplicationQuit();
+		return 0;
+	}
+
+	inline static bool nestedStackPreserved = false;
+	inline static bool nestedTraceRunningPreserved =
+		false;
+};
+
+namespace
+{
+enum class RecordedNpcAction
+{
+	None,
+	Stand,
+	Walk,
+	Run,
+	Jump,
+	Attack,
+	Magic,
+	Sit,
+	Hurt,
+	Death,
+	Special,
+};
+
+class RecordingNPC : public NPC
+{
+public:
+	void resetRecording()
+	{
+		recordedAction = RecordedNpcAction::None;
+		recordedDestination = {};
+		specialActionFile.clear();
+		specialActionStartCount = 0;
+		eventRunCount = 0;
+		goToCount = 0;
+		runToCount = 0;
+		goToExCount = 0;
+		goToDirCount = 0;
+		recordedDirection = -1;
+		recordedDistance = -1;
+		initResCount = 0;
+		setLevelCount = 0;
+		loadActionFileCount = 0;
+		loadedActionFile.clear();
+		loadedAction = -1;
+		specialActionStartSucceeds = true;
+		inputEnabledDuringEventRun = true;
+		inputEnabledDuringBlockingMove = true;
+		fightState.set(false);
+	}
+
+	void beginStand() override
+	{
+		recordedAction = RecordedNpcAction::Stand;
+	}
+
+	void beginWalk(Point destination) override
+	{
+		recordedAction = RecordedNpcAction::Walk;
+		recordedDestination = destination;
+	}
+
+	void beginRun(Point destination, bool = false) override
+	{
+		recordedAction = RecordedNpcAction::Run;
+		recordedDestination = destination;
+	}
+
+	void beginJump(Point destination, bool = false) override
+	{
+		recordedAction = RecordedNpcAction::Jump;
+		recordedDestination = destination;
+	}
+
+	void beginAttack(Point destination, std::shared_ptr<GameElement>, bool = false) override
+	{
+		recordedAction = RecordedNpcAction::Attack;
+		recordedDestination = destination;
+	}
+
+	void beginMagic(Point destination, std::shared_ptr<GameElement>, bool = false) override
+	{
+		recordedAction = RecordedNpcAction::Magic;
+		recordedDestination = destination;
+	}
+
+	void beginSit() override
+	{
+		recordedAction = RecordedNpcAction::Sit;
+	}
+
+	void beginHurt() override
+	{
+		recordedAction = RecordedNpcAction::Hurt;
+	}
+
+	void beginDie() override
+	{
+		recordedAction = RecordedNpcAction::Death;
+	}
+
+	void beginSpecial() override
+	{
+		recordedAction = RecordedNpcAction::Special;
+	}
+
+	void goTo(Point destination) override
+	{
+		recordedDestination = destination;
+		inputEnabledDuringBlockingMove =
+			gm == nullptr || gm->global.data.canInput;
+		++goToCount;
+	}
+
+	void goToEx(Point destination) override
+	{
+		recordedDestination = destination;
+		++goToExCount;
+	}
+
+	void runTo(Point destination) override
+	{
+		recordedAction = RecordedNpcAction::Run;
+		recordedDestination = destination;
+		inputEnabledDuringBlockingMove = gm == nullptr || gm->global.data.canInput;
+		++runToCount;
+	}
+
+	void goToDir(int direction, int distance) override
+	{
+		recordedDirection = direction;
+		recordedDistance = distance;
+		inputEnabledDuringBlockingMove =
+			gm == nullptr || gm->global.data.canInput;
+		++goToDirCount;
+	}
+
+	void initRes(const std::string&) override
+	{
+		++initResCount;
+	}
+
+	void setLevel(int newLevel) override
+	{
+		level = newLevel;
+		++setLevelCount;
+	}
+
+	void loadActionFile(const std::string& fileName, int action) override
+	{
+		loadedActionFile = fileName;
+		loadedAction = action;
+		++loadActionFileCount;
+	}
+
+	bool startScriptSpecialAction(const std::string& fileName) override
+	{
+		specialActionFile = fileName;
+		++specialActionStartCount;
+		if (specialActionStartSucceeds)
+		{
+			recordedAction = RecordedNpcAction::Special;
+		}
+		return specialActionStartSucceeds;
+	}
+
+	unsigned int eventRun() override
+	{
+		++eventRunCount;
+		inputEnabledDuringEventRun = gm == nullptr || gm->global.data.canInput;
+		return 0;
+	}
+
+	RecordedNpcAction recordedAction = RecordedNpcAction::None;
+	Point recordedDestination = {};
+	std::string specialActionFile;
+	int specialActionStartCount = 0;
+	int eventRunCount = 0;
+	int goToCount = 0;
+	int runToCount = 0;
+	int goToExCount = 0;
+	int goToDirCount = 0;
+	int recordedDirection = -1;
+	int recordedDistance = -1;
+	int initResCount = 0;
+	int setLevelCount = 0;
+	int loadActionFileCount = 0;
+	std::string loadedActionFile;
+	int loadedAction = -1;
+	bool specialActionStartSucceeds = true;
+	bool inputEnabledDuringEventRun = true;
+	bool inputEnabledDuringBlockingMove = true;
+};
+
+class InMemorySpecialActionNPC : public NPC
+{
+public:
+	void loadSpecialAction(const std::string& fileName) override
+	{
+		loadedFileName = fileName;
+		++loadCount;
+		res.special.imageFile = fileName;
+		res.special.imagePackage = nullptr;
+		if (provideResource)
+		{
+			res.special.imagePackage = std::make_shared<IMPImage>();
+			res.special.imagePackage->directions = 1;
+			res.special.imagePackage->interval = 50;
+			res.special.imagePackage->frame.resize(1);
+		}
+	}
+
+	unsigned int eventRun() override
+	{
+		++eventRunCount;
+		return 0;
+	}
+
+	void advanceFrameForTest(UTime elapsedMilliseconds)
+	{
+		setTime(getTime() + elapsedMilliseconds);
+		frameTime = elapsedMilliseconds;
+		onUpdate();
+	}
+
+	std::string loadedFileName;
+	int loadCount = 0;
+	int eventRunCount = 0;
+	bool provideResource = true;
+};
+
+class BlockingInMemorySpecialActionNPC : public NPC
+{
+public:
+	void loadSpecialAction(const std::string& fileName) override
+	{
+		res.special.imageFile = fileName;
+		res.special.imagePackage = std::make_shared<IMPImage>();
+		res.special.imagePackage->directions = 1;
+		res.special.imagePackage->interval = 1;
+		res.special.imagePackage->frame.resize(1);
+	}
+};
+
+bool check(bool condition, const char* message)
+{
+	if (!condition)
+	{
+		std::cerr << "FAILED: " << message << '\n';
+	}
+	return condition;
+}
+
+ResourceManifest explicitOriginalBehavior(int originalType)
+{
+	ResourceManifest manifest;
+	manifest.type = originalType;
+	manifest.typeDefined = true;
+	const bool trilogy = originalType == GAME_YYCS ||
+		originalType == GAME_XJXQY;
+	manifest.levelUpThresholdMode = trilogy
+		? LevelUpThresholdMode::GreaterThan
+		: LevelUpThresholdMode::GreaterThanOrEqual;
+	manifest.levelUpThresholdModeDefined = true;
+	manifest.partnerFollowRadius = trilogy ? 2 : 1;
+	manifest.partnerFollowRadiusDefined = true;
+	manifest.partnerFollowRunRadius = 5;
+	manifest.partnerFollowRunRadiusDefined = true;
+	manifest.npcActionProfile = originalType == GAME_YYCS
+		? ScriptNpcActionProfile::Yycs
+		: (originalType == GAME_XJXQY
+			? ScriptNpcActionProfile::Xjxqy
+			: ScriptNpcActionProfile::Legacy);
+	manifest.npcActionProfileDefined = true;
+	manifest.npcRuntimeProfile = trilogy
+		? ScriptNpcRuntimeProfile::Trilogy
+		: ScriptNpcRuntimeProfile::Legacy;
+	manifest.npcRuntimeProfileDefined = true;
+	manifest.specialActionMode = trilogy
+		? ScriptSpecialActionMode::Overlay
+		: ScriptSpecialActionMode::Replace;
+	manifest.specialActionModeDefined = true;
+	manifest.addLifeMode = trilogy
+		? ScriptAddLifeMode::DirectClamp
+		: ScriptAddLifeMode::PlayerRules;
+	manifest.addLifeModeDefined = true;
+	return manifest;
+}
+
+void applyOriginalBehavior(Global& global, int originalType)
+{
+	global.applyResourceManifestFeatures(
+		explicitOriginalBehavior(originalType));
+}
+
+struct LuaTypeExpectation
+{
+	const char* name;
+	int type;
+};
+
+bool checkGlobalTypes(
+	Script& script,
+	const std::vector<LuaTypeExpectation>& expectations,
+	const char* profileName)
+{
+	bool ok = true;
+	for (const auto& expectation : expectations)
+	{
+		const int actualType =
+			ScriptEngineRuntimeTestAccess::globalType(script, expectation.name);
+		const std::string message =
+			std::string(profileName) + " global '" + expectation.name +
+			"' has the expected type";
+		ok = check(actualType == expectation.type, message.c_str()) && ok;
+	}
+	return ok;
+}
+
+bool checkGlobalTableFieldTypes(
+	Script& script,
+	const char* tableName,
+	const std::vector<LuaTypeExpectation>& expectations,
+	const char* profileName)
+{
+	bool ok = true;
+	for (const auto& expectation : expectations)
+	{
+		const int actualType =
+			ScriptEngineRuntimeTestAccess::globalTableFieldType(
+				script, tableName, expectation.name);
+		const std::string message =
+			std::string(profileName) + " table '" + tableName + "." +
+			expectation.name + "' has the expected type";
+		ok = check(actualType == expectation.type, message.c_str()) && ok;
+	}
+	return ok;
+}
+
+bool runScriptLibraryProfileTests()
+{
+	bool ok = true;
+	Script fullBefore;
+	Script editorRunSafe(ScriptLibraryProfile::EditorRunSafe);
+	Script fullAfter;
+
+	const std::vector<LuaTypeExpectation> fullGlobals = {
+		{ "collectgarbage", LUA_TFUNCTION },
+		{ "dofile", LUA_TFUNCTION },
+		{ "load", LUA_TFUNCTION },
+		{ "loadfile", LUA_TFUNCTION },
+		{ "require", LUA_TFUNCTION },
+		{ "package", LUA_TTABLE },
+		{ "io", LUA_TTABLE },
+		{ "debug", LUA_TTABLE },
+		{ "os", LUA_TTABLE },
+	};
+	ok = checkGlobalTypes(fullBefore, fullGlobals, "full-before") && ok;
+	ok = checkGlobalTypes(fullAfter, fullGlobals, "full-after") && ok;
+
+	const std::vector<LuaTypeExpectation> fullOsFields = {
+		{ "clock", LUA_TFUNCTION },
+		{ "date", LUA_TFUNCTION },
+		{ "difftime", LUA_TFUNCTION },
+		{ "execute", LUA_TFUNCTION },
+		{ "exit", LUA_TFUNCTION },
+		{ "getenv", LUA_TFUNCTION },
+		{ "remove", LUA_TFUNCTION },
+		{ "rename", LUA_TFUNCTION },
+		{ "setlocale", LUA_TFUNCTION },
+		{ "time", LUA_TFUNCTION },
+		{ "tmpname", LUA_TFUNCTION },
+	};
+	ok = checkGlobalTableFieldTypes(
+		fullBefore, "os", fullOsFields, "full-before") && ok;
+	ok = checkGlobalTableFieldTypes(
+		fullAfter, "os", fullOsFields, "full-after") && ok;
+
+	const std::vector<LuaTypeExpectation> safeAllowedGlobals = {
+		{ "_G", LUA_TTABLE },
+		{ "_VERSION", LUA_TSTRING },
+		{ "assert", LUA_TFUNCTION },
+		{ "pairs", LUA_TFUNCTION },
+		{ "pcall", LUA_TFUNCTION },
+		{ "tostring", LUA_TFUNCTION },
+		{ "type", LUA_TFUNCTION },
+		{ "coroutine", LUA_TTABLE },
+		{ "math", LUA_TTABLE },
+		{ "os", LUA_TTABLE },
+		{ "string", LUA_TTABLE },
+		{ "table", LUA_TTABLE },
+		{ "utf8", LUA_TTABLE },
+		{ "assign", LUA_TFUNCTION },
+		{ "runscript", LUA_TFUNCTION },
+		{ "printf", LUA_TFUNCTION },
+	};
+	ok = checkGlobalTypes(
+		editorRunSafe, safeAllowedGlobals, "editor-run-safe") && ok;
+
+	const std::vector<LuaTypeExpectation> safeBlockedGlobals = {
+		{ "collectgarbage", LUA_TNIL },
+		{ "dofile", LUA_TNIL },
+		{ "load", LUA_TNIL },
+		{ "loadfile", LUA_TNIL },
+		{ "require", LUA_TNIL },
+		{ "package", LUA_TNIL },
+		{ "io", LUA_TNIL },
+		{ "debug", LUA_TNIL },
+	};
+	ok = checkGlobalTypes(
+		editorRunSafe, safeBlockedGlobals, "editor-run-safe") && ok;
+
+	const std::vector<LuaTypeExpectation> safeOsFields = {
+		{ "clock", LUA_TFUNCTION },
+		{ "date", LUA_TFUNCTION },
+		{ "difftime", LUA_TFUNCTION },
+		{ "time", LUA_TFUNCTION },
+		{ "execute", LUA_TNIL },
+		{ "exit", LUA_TNIL },
+		{ "getenv", LUA_TNIL },
+		{ "remove", LUA_TNIL },
+		{ "rename", LUA_TNIL },
+		{ "setlocale", LUA_TNIL },
+		{ "tmpname", LUA_TNIL },
+	};
+	ok = checkGlobalTableFieldTypes(
+		editorRunSafe, "os", safeOsFields, "editor-run-safe") && ok;
+	ok = check(
+		ScriptEngineRuntimeTestAccess::globalTableEntryCount(
+			editorRunSafe, "os") == 4,
+		"editor-run-safe os table contains exactly four approved functions") &&
+		ok;
+
+	const std::vector<LuaTypeExpectation> blockedLoadedModules = {
+		{ LUA_LOADLIBNAME, LUA_TNIL },
+		{ LUA_IOLIBNAME, LUA_TNIL },
+		{ LUA_DBLIBNAME, LUA_TNIL },
+	};
+	for (const auto& expectation : blockedLoadedModules)
+	{
+		const int actualType =
+			ScriptEngineRuntimeTestAccess::registryTableFieldType(
+				editorRunSafe, LUA_LOADED_TABLE, expectation.name);
+		const std::string message =
+			std::string("editor-run-safe loaded registry omits '") +
+			expectation.name + "'";
+		ok = check(actualType == expectation.type, message.c_str()) && ok;
+	}
+
+	const std::vector<const char*> blockedPreloads = {
+		LUA_LOADLIBNAME,
+		LUA_IOLIBNAME,
+		LUA_OSLIBNAME,
+		LUA_DBLIBNAME,
+	};
+	for (const char* name : blockedPreloads)
+	{
+		const int actualType =
+			ScriptEngineRuntimeTestAccess::registryTableFieldType(
+				editorRunSafe, LUA_PRELOAD_TABLE, name);
+		const std::string message =
+			std::string("editor-run-safe preload registry omits '") +
+			name + "'";
+		ok = check(actualType == LUA_TNIL, message.c_str()) && ok;
+	}
+
+	ok = check(
+		ScriptEngineRuntimeTestAccess::globalMatchesRegistryTableField(
+			editorRunSafe, LUA_GNAME, LUA_LOADED_TABLE, LUA_GNAME),
+		"editor-run-safe loaded global table is the sanitized global table") &&
+		ok;
+	ok = check(
+		ScriptEngineRuntimeTestAccess::globalMatchesRegistryTableField(
+			editorRunSafe, LUA_OSLIBNAME, LUA_LOADED_TABLE, LUA_OSLIBNAME),
+		"editor-run-safe loaded os module is the restricted global os table") &&
+		ok;
+
+	const int safeLibraryResult = ScriptEngineRuntimeTestAccess::execute(
+		editorRunSafe,
+		"assert(math.abs(-4) == 4); "
+		"assert(string.upper('a') == 'A'); "
+		"local values = {}; table.insert(values, 3); "
+		"assert(values[1] == 3); "
+		"local thread = coroutine.create(function() return 7 end); "
+		"local resumed, value = coroutine.resume(thread); "
+		"assert(resumed and value == 7); "
+		"assert(utf8.len('A') == 1); "
+		"assert(os.difftime(9, 4) == 5)");
+	ok = check(
+		safeLibraryResult == LUA_OK &&
+			ScriptEngineRuntimeTestAccess::stackTop(editorRunSafe) == 0,
+		"editor-run-safe approved libraries execute and restore the stack") &&
+		ok;
+
+	const int blockedLibraryResult = ScriptEngineRuntimeTestAccess::execute(
+		editorRunSafe, "return io.open('editor-run-escape.txt', 'w')");
+	ok = check(
+		blockedLibraryResult != LUA_OK &&
+			ScriptEngineRuntimeTestAccess::stackTop(editorRunSafe) == 0,
+		"editor-run-safe blocked library errors restore the stack") && ok;
+
+	return ok;
+}
+
+std::vector<std::uint8_t> scriptBytes(
+	const std::string& source)
+{
+	return std::vector<std::uint8_t>(
+		source.begin(),
+		source.end());
+}
+
+bool runExactScriptDiagnosticTests()
+{
+	bool ok = true;
+	Script script(ScriptLibraryProfile::EditorRunSafe);
+	const std::string virtualPath =
+		u8"script/map/嵌套/入口.lua";
+
+	ExactScriptExecutionResult result =
+		script.runExactResourceBytes(
+			scriptBytes("local value = 1\nreturn value\n"),
+			virtualPath);
+	ok = check(
+		result.succeeded() &&
+			result.line == 0 &&
+			result.column == 0 &&
+			result.message.empty(),
+		"exact Lua success has no synthetic source location") && ok;
+
+	result = script.runExactResourceBytes(
+		scriptBytes(
+			"local value = 1\n"
+			"local broken = )\n"),
+		virtualPath);
+	ok = check(
+		result.status ==
+			ExactScriptExecutionStatus::LoadFailed &&
+			result.line == 2 &&
+			result.column == 16 &&
+			result.message ==
+				"unexpected symbol near ')'",
+		"exact Lua load failure preserves path line and an unambiguous true token column") &&
+		ok;
+
+	result = script.runExactResourceBytes(
+		scriptBytes(
+			u8"local text = '中文'; local broken = )\n"),
+		virtualPath);
+	ok = check(
+		result.status ==
+			ExactScriptExecutionStatus::LoadFailed &&
+			result.line == 1 &&
+			result.column == 35 &&
+			result.message ==
+				"unexpected symbol near ')'",
+		"exact Lua load column is one-based Unicode code points rather than UTF-8 bytes") &&
+		ok;
+
+	std::string invalidUtf8Source = "local text = '";
+	invalidUtf8Source.push_back(static_cast<char>(0xFF));
+	invalidUtf8Source += "'; local broken = )\n";
+	result = script.runExactResourceBytes(
+		scriptBytes(invalidUtf8Source),
+		virtualPath);
+	ok = check(
+		result.status ==
+			ExactScriptExecutionStatus::LoadFailed &&
+			result.line == 1 &&
+			result.column == 0 &&
+			result.message ==
+				"unexpected symbol near ')'",
+		"exact Lua load column stays unknown when the source line is not valid UTF-8") &&
+		ok;
+
+	result = script.runExactResourceBytes(
+		scriptBytes("local broken = ) + )\n"),
+		virtualPath);
+	ok = check(
+		result.status ==
+			ExactScriptExecutionStatus::LoadFailed &&
+			result.line == 1 &&
+			result.column == 0,
+		"exact Lua load failure leaves an ambiguous token column unknown") &&
+		ok;
+
+	result = script.runExactResourceBytes(
+		scriptBytes(
+			"local value = 1\n"
+			"error('12: runtime marker')\n"),
+		virtualPath);
+	ok = check(
+		result.status ==
+			ExactScriptExecutionStatus::RuntimeFailed &&
+			result.line == 2 &&
+			result.column == 0 &&
+			result.message == "12: runtime marker",
+		"exact Lua runtime message numeric prefix is not misread as a Lua column") &&
+		ok;
+	ok = check(
+		ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"exact Lua diagnostics restore the shared stack") && ok;
+	return ok;
+}
+
+ResolvedTraceScriptSource traceSource(
+	const std::string& virtualPath,
+	const std::string& contents)
+{
+	ResolvedTraceScriptSource source;
+	source.bytes.assign(
+		contents.begin(),
+		contents.end());
+	source.identity.virtualPath = virtualPath;
+	source.identity.rootKind =
+		EditorRun::RuntimeTraceRootKind::Active;
+	source.identity.rootOrdinal = 0;
+	source.identity.resourcePackId = "test-pack";
+	source.identity.sourceLayer =
+		EditorRun::RuntimeTraceSourceLayer::Formal;
+	return source;
+}
+
+std::size_t substringCount(
+	const std::string& text,
+	const std::string& needle)
+{
+	std::size_t count = 0;
+	for (std::size_t offset = 0;
+		(offset = text.find(needle, offset)) !=
+			std::string::npos;
+		offset += needle.size())
+	{
+		++count;
+	}
+	return count;
+}
+
+bool runRuntimeTraceInstrumentationTests()
+{
+	bool ok = true;
+	std::mutex traceMutex;
+	std::string trace;
+	std::unique_ptr<EditorRun::RuntimeTraceWriter> writer =
+		EditorRun::RuntimeTraceWriter::create(
+			"123e4567-e89b-12d3-a456-426614174000",
+			[&traceMutex, &trace](
+				std::string_view batch)
+			{
+				std::lock_guard<std::mutex> lock(
+					traceMutex);
+				trace.append(
+					batch.data(),
+					batch.size());
+				return true;
+			});
+	ok = check(
+		writer != nullptr && writer->valid(),
+		"runtime trace writer starts for production Script instrumentation") &&
+		ok;
+	if (writer == nullptr || !writer->valid())
+	{
+		return false;
+	}
+
+	Script script(
+		ScriptLibraryProfile::EditorRunSafe,
+		writer.get());
+	ScriptEngineRuntimeTestAccess::
+		registerTraceNestedRunner(script);
+	ScriptEngineRuntimeTestAccess::
+		registerQuitRequester(script);
+
+	const ExactScriptExecutionResult outer =
+		script.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/entry.lua",
+				"printf('outer trace')\n"
+				"test_run_trace_nested()\n"));
+	ok = check(
+		outer.succeeded() &&
+			ScriptEngineRuntimeTestAccess::
+				nestedTraceRunningWasPreserved() &&
+			!script.running &&
+			script.currentExecutionId() == 0,
+		"nested traced execution preserves the outer running state and unwinds its execution stack") &&
+		ok;
+
+	const ExactScriptExecutionResult empty =
+		script.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/empty.lua",
+				""));
+	ok = check(
+		empty.succeeded(),
+		"zero-byte resolved editor-run Lua is a completed empty chunk") &&
+		ok;
+
+	const ExactScriptExecutionResult loadError =
+		script.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/loaderror.lua",
+				"local broken = )\n"));
+	ok = check(
+		loadError.status ==
+			ExactScriptExecutionStatus::LoadFailed,
+		"resolved traced Lua records load failures") &&
+		ok;
+
+	const ExactScriptExecutionResult runtimeError =
+		script.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/runtimeerror.lua",
+				"error('trace runtime failure')\n"));
+	ok = check(
+		runtimeError.status ==
+			ExactScriptExecutionStatus::RuntimeFailed,
+		"resolved traced Lua records runtime failures") &&
+		ok;
+
+	const ExactScriptExecutionResult aborted =
+		script.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/quit.lua",
+				"test_request_application_quit()\n"
+				"printf('must not run')\n"));
+	ok = check(
+		aborted.status ==
+			ExactScriptExecutionStatus::RuntimeFailed,
+		"application quit aborts resolved traced Lua") &&
+		ok;
+	Element::resetApplicationQuitState();
+
+	for (int instance = 0; instance < 2; ++instance)
+	{
+		Script replacement(ScriptLibraryProfile::EditorRunSafe, writer.get());
+		ok = check(
+			replacement.runResolvedTraceScriptSource(
+				traceSource("script/common/recreated.lua", "local loaded = true\n"))
+				.succeeded() && writer->valid() &&
+				replacement.currentExecutionId() == 0,
+			"successive Script instances share the writer's execution ID sequence") && ok;
+	}
+
+	ok = check(
+		writer->finish(
+			EditorRun::RuntimeTraceSessionFinishStatus::
+				Completed),
+		"runtime trace writer finishes after Script instrumentation") &&
+		ok;
+	{
+		std::lock_guard<std::mutex> lock(traceMutex);
+		ok = check(
+			trace.find(
+				"\"virtualPath\":\"script/common/entry.lua\"") !=
+				std::string::npos,
+			"script.start preserves canonical lowercase virtual-path spelling") &&
+			ok;
+		ok = check(
+			trace.find(
+				"\"eventType\":\"script.start\",\"elapsedMicroseconds\":") !=
+				std::string::npos &&
+			trace.find(
+				"\"executionId\":2,\"parentExecutionId\":1") !=
+				std::string::npos,
+			"nested script.start captures the active parent execution") &&
+			ok;
+		ok = check(
+			trace.find(
+				"\"eventType\":\"source.line\"") !=
+				std::string::npos &&
+			substringCount(
+				trace,
+				"\"eventType\":\"api.call\"") >= 3 &&
+			substringCount(
+				trace,
+				"\"apiName\":\"printf\"") == 2,
+			"line hooks and precise registered API names are emitted") &&
+			ok;
+		ok = check(
+			trace.find(
+				"\"executionId\":3,\"status\":\"completed\"") !=
+				std::string::npos &&
+			trace.find(
+				"\"executionId\":4,\"status\":\"load-error\"") !=
+				std::string::npos &&
+			trace.find(
+				"\"executionId\":5,\"status\":\"runtime-error\"") !=
+				std::string::npos &&
+			trace.find(
+				"\"executionId\":6,\"status\":\"aborted\"") !=
+				std::string::npos,
+			"script.finish distinguishes empty success, load error, runtime error, and quit abort") &&
+			ok;
+		ok = check(
+			substringCount(trace, "\"eventType\":\"script.start\"") == 8 &&
+			substringCount(trace, "\"eventType\":\"script.finish\"") == 8 &&
+			trace.find("\"executionId\":7,\"status\":\"completed\"") != std::string::npos &&
+			trace.find("\"executionId\":8,\"status\":\"completed\"") != std::string::npos,
+			"trace remains complete after two Script instances are created and destroyed") && ok;
+	}
+
+	Script noWriter(
+		ScriptLibraryProfile::EditorRunSafe);
+	ok = check(
+		noWriter.runResolvedTraceScriptSource(
+			traceSource(
+				"script/common/nowriter.lua",
+				"printf('ordinary no writer')\n"))
+			.succeeded() &&
+			!noWriter.running &&
+			noWriter.currentExecutionId() == 0,
+		"resolved execution remains functional without a trace writer") &&
+		ok;
+	return ok;
+}
+
+bool runGoodsUseWithoutMenusTests()
+{
+	bool ok = true;
+	for (bool keepMenuController : { true, false })
+	{
+		GameManager gameManager;
+		ok = check(gameManager.menu != nullptr &&
+			gameManager.menu->goodsMenu == nullptr &&
+			gameManager.menu->bottomMenu == nullptr &&
+			gameManager.menu->equipMenu == nullptr,
+			"goods-use regression starts before inventory menus are created") && ok;
+		if (!keepMenuController)
+		{
+			gameManager.menu.reset();
+		}
+		auto& manager = gameManager.goodsManager;
+		for (int itemIndex : { manager.storeBegin(), manager.bottomBegin() })
+		{
+			auto& item = manager.goodsList[itemIndex];
+			item.iniFile = "menu_absent_drug.ini";
+			item.number = 2;
+			item.goods = std::make_shared<Goods>();
+			item.goods->kind = gkDrug;
+			item.goods->life = 15;
+			item.goods->coldMilliSeconds = 100;
+			gameManager.player->lifeMax = 100;
+			gameManager.player->life = 20;
+			ok = check(manager.useItem(itemIndex) && item.number == 1 &&
+				item.remainColdMilliseconds == 100 && gameManager.player->life == 35,
+				"using a store or bottom-slot drug without menus preserves effect, count and cooldown") && ok;
+			item.remainColdMilliseconds = 0;
+			ok = check(manager.useItem(itemIndex) && item.iniFile.empty() &&
+				item.goods == nullptr && gameManager.player->life == 50,
+				"using the last drug without menus clears the slot after applying its effect") && ok;
+
+			item.iniFile = "menu_absent_equipment.ini";
+			item.number = 1;
+			item.goods = std::make_shared<Goods>();
+			item.goods->kind = gkEquipment;
+			item.goods->part = "HaNd";
+			item.goods->attack = 7;
+			const auto incomingEquipment = item.goods;
+			auto& equipped = manager.goodsList[manager.equipIndex(4)];
+			equipped.iniFile = "menu_absent_previous_equipment.ini";
+			equipped.number = 1;
+			equipped.goods = std::make_shared<Goods>(*incomingEquipment);
+			equipped.goods->attack = 3;
+			const auto previousEquipment = equipped.goods;
+			manager.refreshEquipmentEffects();
+			const int previousAttack = gameManager.player->getAttack();
+			ok = check(manager.useItem(itemIndex) &&
+				equipped.goods == incomingEquipment && item.goods == previousEquipment &&
+				gameManager.player->getAttack() == previousAttack + 4,
+				"equipping from store or bottom slots without menus swaps equipment and recalculates attributes") && ok;
+			item.clear();
+			equipped.clear();
+			manager.refreshEquipmentEffects();
+		}
+	}
+	return ok;
+}
+}
+
+bool runScriptPlayerNameTests(GameManager& gameManager)
+{
+	const auto previousGlobal = gameManager.global;
+	const auto previousNpcs = gameManager.npcManager->npcList;
+	const auto previousPlayerName = gameManager.player->npcName;
+	const auto previousPosition = gameManager.player->getPosition();
+	const int previousState = gameManager.player->state;
+	const std::string profileText = u8"[Game]\nId=NAME_TEST\n[Script]\nPlayerName=杨影枫\nNpcActionProfile=YYCS\nNpcRuntimeProfile=Trilogy\n";
+	ResourceManifest profile;
+	bool ok = check(profile.loadFromBuffer(profileText.data(), static_cast<int>(profileText.size())),
+		"player-name profile loads without a new required field");
+	gameManager.global.applyResourceManifestFeatures(profile);
+	gameManager.player->npcName = u8"杨影枫";
+	gameManager.npcManager->npcList.clear();
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script,
+		"assign('PlayerName',99); assign('playername',77); setnpcpos('#name',4,5); getnpcstate('#name','MapX','NameTargetX')");
+	ok = check(gameManager.player->getPosition() == Point{4,5}
+		&& gameManager.varList.getInteger("NameTargetX") == 4
+		&& gameManager.varList.getInteger("PlayerName") == 99
+		&& gameManager.varList.getInteger("playername") == 77,
+		"configured #name finds the actual protagonist without aliasing script variables") && ok;
+
+	auto protagonist = std::make_shared<RecordingNPC>();
+	auto duplicate = std::make_shared<RecordingNPC>();
+	protagonist->npcName = duplicate->npcName = u8"杨影枫";
+	protagonist->kind = duplicate->kind = nkNormal;
+	protagonist->setPosition({1,1}, false);
+	duplicate->setPosition({2,2}, false);
+	gameManager.npcManager->npcList = {protagonist, duplicate};
+	gameManager.player->npcName = u8"纳兰真";
+	gameManager.player->setPosition({7,8}, false);
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script,
+		"setnpcpos('#name',4,53); setnpckind('#name',3); setnpcscript('#name','#name.lua'); "
+		"getnpcstate('#name','MapX','NameTargetX'); npcgoto('#name',6,7)");
+	ok = check(protagonist->getPosition() == Point{4,53}
+		&& protagonist->kind == nkPartner && duplicate->kind == nkPartner
+		&& duplicate->getPosition() == Point{2,2}
+		&& protagonist->scriptFile == "#name.lua"
+		&& protagonist->recordedDestination == Point{6,7}
+		&& gameManager.player->getPosition() == Point{7,8}
+		&& gameManager.varList.getInteger("NameTargetX") == 4,
+		"after switching heroine, #name finds the protagonist NPC and preserves first-target and file-name rules") && ok;
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script, "delnpc('#name')");
+	ok = check(gameManager.npcManager->npcList == std::vector<std::shared_ptr<NPC>>{protagonist, duplicate},
+		"#name cleanup preserves matching partners") && ok;
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script, "setnpckind('#name',0); delnpc('#name')");
+	ok = check(gameManager.npcManager->npcList.empty()
+		&& gameManager.player->npcName == u8"纳兰真",
+		"#name deletion removes matching NPCs without deleting the current player") && ok;
+	gameManager.player->npcName = u8"杨影枫";
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script, "delnpc('#name'); setnpcpos('#name',8,9)");
+	ok = check(gameManager.player->getPosition() == Point{8,9},
+		"switching back keeps the protagonist addressable and immune to DelNpc") && ok;
+	ScriptEngineRuntimeTestAccess::execute(gameManager.script, "setnpcpos('#Name',10,11)");
+	ok = check(gameManager.player->getPosition() == Point{8,9}, "name token case is exact") && ok;
+	gameManager.global.applyResourceManifestFeatures(ResourceManifest::createDefault(""));
+	protagonist->npcName = "#name";
+	gameManager.npcManager->npcList = {protagonist};
+	ok = check(gameManager.npcManager->findNPC("#name") == std::vector<std::shared_ptr<NPC>>{protagonist},
+		"unconfigured resources retain literal NPC lookup instead of inheriting another game's name") && ok;
+	gameManager.npcManager->npcList = previousNpcs;
+	gameManager.player->npcName = previousPlayerName;
+	gameManager.player->setPosition(previousPosition, false);
+	gameManager.player->state = previousState;
+	gameManager.global = previousGlobal;
+	return ok;
+}
+
+bool runPlayerOffsetWalkScriptTests()
+{
+	class FrameSteppedOffsetPlayer : public Player
+	{
+	public:
+		unsigned int eventRun() override
+		{
+			inputEnabledDuringMove = gm->global.data.canInput;
+			frames = 0;
+			while (isWalking() && frames < 2000)
+			{
+				setTime(getTime() + 16);
+				actionManager->update(16);
+				++frames;
+				if (interruptAfterFirstFrame && frames == 1) beginStand();
+			}
+			return 0;
+		}
+		bool inputEnabledDuringMove = true;
+		bool interruptAfterFirstFrame = false;
+		int frames = 0;
+	};
+	GameManager gameManager;
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	auto player = std::make_shared<FrameSteppedOffsetPlayer>();
+	gameManager.player = player;
+	player->res.walk.imagePackage = std::make_shared<IMPImage>();
+	player->res.walk.imagePackage->directions = 8;
+	player->res.walk.imagePackage->interval = 40;
+	player->res.walk.imagePackage->frame.resize(8);
+	player->res.stand.imagePackage = player->res.walk.imagePackage;
+	player->life = player->info.lifeMax = 100;
+	Script script;
+	bool ok = true;
+	const int xSteps[] = { 0, -2, -2, -2, 0, 2, 2, 2 };
+	const int ySteps[] = { 1, 1, 0, -1, -1, -1, 0, 1 };
+	for (int direction = 0; direction < 8; ++direction)
+	{
+		player->setPosition({ 5, 6 }, false);
+		player->setOffset({ 1.5f, -2.0f });
+		gameManager.global.data.canInput = true;
+		const int result = ScriptEngineRuntimeTestAccess::execute(script,
+			"playergotodirex(" + std::to_string(direction) + ",3)");
+		const PointEx offset = player->getOffset();
+		ok = check(result == LUA_OK && player->getPosition() == Point{ 5, 6 }
+			&& offset.x == 1.5f + xSteps[direction] * 3 && offset.y == -2.0f + ySteps[direction] * 3
+			&& player->isStanding() && player->frames > 0 && player->frames < 2000,
+			"PlayerGotoDirEx waits for offset walking in each legacy direction without changing map tiles") && ok;
+		ok = check(!player->inputEnabledDuringMove && gameManager.global.data.canInput,
+			"offset script walking blocks player input and restores it on completion") && ok;
+	}
+	const PointEx previousOffset = player->getOffset();
+	const int previousFrames = player->frames;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"playergotodirex(0,0); playergotodirex(0,-1); playergotodirex(8,3); playergotodirex(0)");
+	ok = check(player->getOffset().x == previousOffset.x && player->getOffset().y == previousOffset.y
+		&& player->frames == previousFrames && gameManager.global.data.canInput,
+		"invalid offset movement parameters do not start a wait or change the actor") && ok;
+	gameManager.global.data.canInput = false;
+	ScriptEngineRuntimeTestAccess::execute(script, "playergotodirex(0,3)");
+	ok = check(!gameManager.global.data.canInput,
+		"offset walking preserves an input block that was already active") && ok;
+	gameManager.global.data.canInput = true;
+	player->interruptAfterFirstFrame = true;
+	ScriptEngineRuntimeTestAccess::execute(script, "playergotodirex(0,128)");
+	ok = check(player->frames == 1 && player->isStanding() && gameManager.global.data.canInput,
+		"replacing the offset action terminates the synchronous wait without forcing the destination") && ok;
+	player->interruptAfterFirstFrame = false;
+	player->res.walk.imagePackage.reset();
+	const int framesBeforeMissingAnimation = player->frames;
+	ScriptEngineRuntimeTestAccess::execute(script, "playergotodirex(0,3)");
+	ok = check(player->frames == framesBeforeMissingAnimation && player->isStanding()
+		&& gameManager.global.data.canInput,
+		"a missing walk animation returns without entering a movement wait") && ok;
+	return ok;
+}
+
+bool runConfiguredPixelRunSpeedTests()
+{
+	GameManager gameManager;
+	gameManager.global.data.NPCAI = false;
+	gameManager.map->data = std::make_shared<MapData>();
+	gameManager.map->data->head.width = gameManager.map->data->head.height = 16;
+	gameManager.map->data->tile.assign(16, std::vector<MapTile>(16));
+	auto player = gameManager.player;
+	player->life = player->info.lifeMax = player->lifeMax = 1000;
+	player->thew = player->info.thewMax = player->thewMax = 1000;
+	NPCActionRes animation;
+	animation.imagePackage = std::make_shared<IMPImage>();
+	animation.imagePackage->directions = 8;
+	animation.imagePackage->interval = 40;
+	animation.imagePackage->frame.resize(16);
+	player->res.stand = player->res.walk = player->res.run = player->res.arun = animation;
+	const float savedGameSpeed = Config::getGameSpeed();
+	Config::setGameSpeed(SPEED_TIME_DEFAULT);
+	const auto reset = [&]()
+	{
+		player->forceBeginStand();
+		player->setPosition({ 6, 6 }, false);
+		gameManager.map->createDataMap();
+	};
+	reset();
+	player->beginRun({ 7, 6 });
+	const UTime legacyRunTime = player->stepLastTime;
+	reset();
+	player->beginWalk({ 7, 6 });
+	const UTime legacyWalkTime = player->stepLastTime;
+	player->forceBeginStand();
+	const std::string text = "[Game]\nId=PIXEL_RUN\n[Gameplay]\nRunSpeedPixelsPerSecond=400\n";
+	ResourceManifest manifest;
+	bool ok = check(manifest.loadFromBuffer(text.data(), static_cast<int>(text.size())),
+		"the real MOD pixel running speed profile parses");
+	gameManager.global.applyResourceManifestFeatures(manifest);
+	reset();
+	player->beginWalk({ 7, 6 });
+	ok = check(player->isWalking() && player->stepLastTime == legacyWalkTime,
+		"a configured pixel running speed does not alter walking") && ok;
+	for (bool fighting : { false, true })
+	{
+		for (int direction = 0; direction < 8; ++direction)
+		{
+			reset();
+			player->fightState.set(fighting);
+			const Point destination = Map::getSubPoint(player->getPosition(), direction);
+			const auto delta = Map::getTilePosition(destination, player->getPosition());
+			const double expectedHalfStep = std::hypot(static_cast<double>(delta.x), static_cast<double>(delta.y)) * 500.0 / 400.0;
+			player->beginRun(destination);
+			ok = check(player->isRunning() && std::abs(static_cast<double>(player->stepLastTime) - expectedHalfStep) <= 0.5,
+				"configured normal and combat running uses the same screen pixel speed in all directions") && ok;
+			int elapsed = 0;
+			while (player->isRunning() && elapsed < 1000)
+			{
+				player->setTime(player->getTime() + 1);
+				player->actionManager->update(1);
+				++elapsed;
+			}
+			ok = check(player->isStanding() && player->getPosition() == destination
+				&& std::abs(elapsed - expectedHalfStep * 2) <= 1.0,
+				"a complete running step reaches its target at the configured pixel duration") && ok;
+		}
+	}
+	reset();
+	player->equipmentChangeMoveSpeedPercent = 20;
+	player->addMoveSpeedPercent = 30;
+	Config::setGameSpeed(SPEED_TIME_DEFAULT * 1.5f);
+	player->beginRun({ 7, 6 });
+	ok = check(std::abs(static_cast<double>(player->stepLastTime) - 64.0 * 500 / 400 / 1.5 / 1.5) <= 0.5,
+		"configured running composes equipment, scripted speed and the existing game speed option") && ok;
+	player->equipmentChangeMoveSpeedPercent = player->addMoveSpeedPercent = 0;
+	Config::setGameSpeed(SPEED_TIME_DEFAULT);
+	for (const char* value : { "", "0", "-1", "nan", "inf", "2147483648", "400junk", "0.5" })
+	{
+		const std::string invalidText = std::string("[Game]\nId=DEFAULT_RUN\n[Gameplay]\nRunSpeedPixelsPerSecond=") + value + "\n";
+		manifest.loadFromBuffer(invalidText.data(), static_cast<int>(invalidText.size()));
+		gameManager.global.applyResourceManifestFeatures(manifest);
+		reset();
+		player->beginRun({ 7, 6 });
+		ok = check(player->stepLastTime == legacyRunTime,
+			"switching to absent or invalid pixel speed restores the existing running rule") && ok;
+	}
+	player->forceBeginStand();
+	Config::setGameSpeed(savedGameSpeed);
+	return ok;
+}
+
+bool runPaperScriptTests()
+{
+	GameManager gameManager;
+	gameManager.varList.ensureInitialized();
+	gameManager.memo.memo = { "Existing quest" };
+	Script script;
+	const int result = ScriptEngineRuntimeTestAccess::execute(script,
+		"openpaper(3,'First page','Second page');assign('paper_returned',1)");
+	return check(result == LUA_OK
+		&& gameManager.varList.getInteger("paper_returned") == 1
+		&& gameManager.menu->menuDisplayed()
+		&& gameManager.menu->blocksWorldInput()
+		&& gameManager.menu->blocksWorldKeyboardInput()
+		&& gameManager.menu->blocksWorldPointerInput()
+		&& gameManager.memo.memo == std::deque<std::string>{ "Existing quest" },
+		"MG OpenPaper returns immediately and retains a reader that owns world input");
+}
+
+bool runMiniGameScriptTests()
+{
+	GameManager gameManager;
+	gameManager.varList.ensureInitialized();
+	Script script;
+	return check(ScriptEngineRuntimeTestAccess::execute(script,
+		"showminigame('unknown');showminigame();assign('minigame_returned',1)") == LUA_OK
+		&& gameManager.varList.getInteger("minigame_returned") == 1
+		&& !gameManager.menu->blocksWorldInput(),
+		"MG ShowMiniGame accepts unsupported or missing names without opening a modal");
+}
+
+bool runMgEqualLevelScriptTests()
+{
+	GameManager gameManager;
+	auto player = gameManager.player;
+	player->npcName = "Hero";
+	player->level = 3;
+	auto partner = std::make_shared<NPC>();
+	partner->npcName = "Partner";
+	partner->kind = nkPartner;
+	partner->relation = nrFriendly;
+	partner->npcLevelIni = "level-hard.ini";
+	partner->npcLevelList.resize(3);
+	auto& info = partner->npcLevelList[2];
+	info.lifeMax = 130;
+	info.thewMax = 33;
+	info.manaMax = 44;
+	info.attack = 17;
+	info.levelUpExp = 900;
+	info.exp = 314;
+	partner->level = 1;
+	partner->life = 2;
+	partner->exp = 77;
+	partner->equipmentAttributes.lifeMax = 10;
+	auto duplicate = std::make_shared<NPC>();
+	duplicate->npcName = "Partner";
+	duplicate->level = 9;
+	gameManager.npcManager->npcList = { partner, duplicate };
+	Script script;
+	bool ok = check(ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('Partner')") == LUA_OK
+		&& partner->level == 3 && duplicate->level == 9 && partner->life == 140
+		&& partner->thew == 33 && partner->mana == 44 && partner->attack == 17
+		&& partner->levelUpExp == 900 && partner->exp == 77,
+		"MG equal-level resets only the first named actor from its own level table and retains friendly experience");
+	partner->kind = nkBattle;
+	partner->relation = nrHostile;
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('Partner')");
+	ok = check(partner->exp == 314,
+		"MG equal-level takes hostile battle experience from the matching level row") && ok;
+	partner->kind = nkPartner;
+	partner->relation = nrNeutral;
+	partner->life = 5;
+	partner->exp = 88;
+	gameManager.scriptNPC = partner;
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('')");
+	ok = check(partner->level == 3 && partner->life == 140 && partner->exp == 88,
+		"an empty MG equal-level name resolves the current script actor, including a neutral partner") && ok;
+	player->level = 7;
+	partner->life = 19;
+	partner->attack = 76;
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('Partner')");
+	ok = check(partner->level == 7 && partner->life == 19 && partner->attack == 76 && partner->exp == 88,
+		"a missing MG level row changes the level without clamping or inventing attributes") && ok;
+	player->level = 3;
+	info.lifeMax = 0;
+	info.life = 125;
+	info.thewMax = info.manaMax = 0;
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('Partner')");
+	ok = check(partner->lifeMax == 125 && partner->life == 135 && partner->thew == 0 && partner->mana == 0,
+		"MG level rows use Life as a fallback and retain explicit zero stamina and mana") && ok;
+	player->levelList.resize(3);
+	player->levelList[2].lifeMax = 150;
+	player->levelList[2].thewMax = 50;
+	player->levelList[2].manaMax = 55;
+	player->exp = 222;
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpclevelequalplayer('Hero')");
+	ok = check(player->level == 3 && player->life == 150 && player->thew == 50
+		&& player->mana == 55 && player->exp == 222,
+		"MG equal-level can address the player by name without changing accumulated experience") && ok;
+	gameManager.scriptNPC.reset();
+	player->life = 3;
+	partner->life = 4;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"setnpclevelequalplayer('missing'); setnpclevelequalplayer(''); setnpclevelequalplayer()");
+	ok = check(player->life == 3 && partner->life == 4,
+		"missing MG equal-level parameters, names or script actors leave other actors untouched") && ok;
+	return ok;
+}
+
+bool runPlayerForcedMovementUpdateTests()
+{
+	class FrameSteppedPlayer : public Player
+	{
+	public:
+		using Element::onUpdate;
+		void advance(UTime elapsed)
+		{
+			setTime(getTime() + elapsed);
+			frameTime = elapsed;
+			onUpdate();
+		}
+	};
+
+	GameManager gameManager;
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	gameManager.map->data = std::make_shared<MapData>();
+	gameManager.map->data->head.width = 16;
+	gameManager.map->data->head.height = 16;
+	gameManager.map->data->tile.assign(16, std::vector<MapTile>(16));
+	gameManager.map->createDataMap();
+	bool ok = true;
+	for (bool forced : { false, true })
+	{
+		float actionFrameProgress = 0.0f;
+		for (int placementMode : { 0, 1, 2 })
+		{
+			const bool scriptPlacement = placementMode != 0;
+			auto player = std::make_shared<FrameSteppedPlayer>();
+			gameManager.player = player;
+			player->npcName = "forced-movement-player";
+			player->life = 100;
+			player->lifeMax = 100;
+			player->info.lifeMax = 100;
+			player->fightState.set(true);
+			player->setPosition({ 5, 6 }, false);
+			player->res.magic.imagePackage = std::make_shared<IMPImage>();
+			player->res.magic.imagePackage->directions = 1;
+			player->res.magic.imagePackage->interval = 100;
+			player->res.magic.imagePackage->frame.resize(1);
+			if (forced)
+			{
+				player->beginMagicForcedMove(
+					{ 7, 6 }, 64.0f, {}, nullptr, 1, lkEnemy, 0, 7, 0, 0);
+			}
+			else
+			{
+				Effect effect;
+				effect.magic.bounce = 120;
+				effect.flyingDirection = { 1, 0 };
+				player->applyBounceFromEffect(effect);
+			}
+			ok = check(!player->canDoAction(acMagic),
+				"active player forced movement rejects casting") && ok;
+			if (scriptPlacement)
+			{
+				if (placementMode == 1)
+				{
+					gameManager.scriptAPI.setPlayerPosition(5, 6);
+				}
+				else
+				{
+					gameManager.scriptAPI.setPlayerPosition("forced-movement-player", 5, 6);
+				}
+				ok = check(player->actionManager->getCurrentActionType() == acStand
+					&& (forced ? player->isMagicForcedMoving() : player->isBouncing())
+					&& player->life == 100,
+					"SetPlayerPos preserves forced movement without prematurely applying end damage") && ok;
+			}
+			player->advance(16);
+			const float progress = forced
+				? player->magicForcedMove.movedProjectedDistance
+				: 120.0f - player->bounceVelocity;
+			ok = check(progress > 0.0f,
+				"player forced movement progresses after action replacement as well as in its action") && ok;
+			if (scriptPlacement)
+			{
+				ok = check(progress == actionFrameProgress,
+					"stand fallback advances player forced movement exactly once per frame") && ok;
+			}
+			else
+			{
+				actionFrameProgress = progress;
+			}
+			for (int frame = 0; frame < 200; ++frame)
+			{
+				player->advance(16);
+			}
+			ok = check(!player->isBouncing() && !player->isMagicForcedMoving()
+				&& player->canDoAction(acMagic),
+				"player forced movement finishes and allows casting after script placement") && ok;
+			// Player::addLife applies the existing 0.8 damage rate: round(7 * 0.8) = 6.
+			ok = check(!forced || (player->getPosition() == Point{ 7, 6 } && player->life == 94),
+				"player forced movement reaches its destination and applies end damage exactly once") && ok;
+		}
+	}
+	return ok;
+}
+
+bool runScriptActionResourceCostTests()
+{
+	class ScriptCostPlayer final : public Player
+	{
+	public:
+		void advance()
+		{
+			setTime(getTime() + 16);
+			actionManager->update(16);
+		}
+		unsigned int eventRun() override
+		{
+			for (int frame = 0; frame < 600 && !isStanding(); ++frame)
+			{
+				advance();
+			}
+			return isStanding() ? erNone : erInitError;
+		}
+	};
+	bool ok = true;
+	for (int originalType : { GAME_JXQY2, GAME_YYCS, GAME_XJXQY })
+	{
+		GameManager gameManager;
+		applyOriginalBehavior(gameManager.global, originalType);
+		gameManager.global.data.NPCAI = false;
+		gameManager.map->data = std::make_shared<MapData>();
+		gameManager.map->data->head.width = gameManager.map->data->head.height = 16;
+		gameManager.map->data->tile.assign(16, std::vector<MapTile>(16));
+		auto player = std::make_shared<ScriptCostPlayer>();
+		gameManager.player = player;
+		player->npcName = "StoryPlayer";
+		player->lifeMax = player->info.lifeMax = player->life = 1000;
+		player->manaMax = player->info.manaMax = player->thewMax = player->info.thewMax = 100;
+		NPCActionRes animation;
+		animation.imagePackage = std::make_shared<IMPImage>();
+		animation.imagePackage->directions = 8;
+		animation.imagePackage->interval = 100;
+		animation.imagePackage->frame.resize(24);
+		player->res.stand = player->res.walk = player->res.run = player->res.jump =
+			player->res.attack = player->res.magic = player->res.hurt = animation;
+		auto magic = std::make_shared<Magic>();
+		magic->loadSucceeded = true;
+		magic->level[1].moveKind = mmkPoint;
+		magic->level[1].lifeFrame = 10;
+		magic->level[1].manaCost = 30;
+		magic->level[1].thewCost = 20;
+		magic->coldMilliSeconds = 1000;
+		auto& magicInfo = gameManager.magicManager.magicList[gameManager.magicManager.bottomBegin()];
+		magicInfo.magic = magic;
+		magicInfo.iniFile = "story_cost.ini";
+		magicInfo.level = 1;
+		player->npcMagic = magic;
+		player->magicIndex = 0;
+		gameManager.map->createDataMap();
+		auto reset = [&](int resources)
+		{
+			player->forceBeginStand();
+			player->setPosition({ 4, 4 }, false);
+			player->setOffset({ 0, 0 });
+			player->mana = player->thew = resources;
+			magicInfo.remainColdMilliseconds = 0;
+			gameManager.effectManager->freeResource();
+			gameManager.map->createDataMap();
+		};
+		for (int resources : { 0, 100 })
+		{
+			for (const char* command : {
+				"npcattack('StoryPlayer',6,6);", "setnpcaction('StoryPlayer',5,6,6);",
+				"playerrunto(8,8);", "playerruntoex(8,8);", "playerjumpto(8,8);",
+				"setnpcaction('StoryPlayer',3,8,8);", "setnpcaction('StoryPlayer',4,8,8);",
+				"usemagic('story_cost.ini',6,6);", "setnpcaction('StoryPlayer',8,6,6);" })
+			{
+				reset(resources);
+				gameManager.inEvent = true;
+				ok = check(ScriptEngineRuntimeTestAccess::execute(gameManager.script, command) == LUA_OK,
+					"scripted resource-cost fixture executes through Lua") && ok;
+				const std::string source = command;
+				if (source != "playerrunto(8,8);" && source != "playerjumpto(8,8);")
+				{
+					ok = check(!player->isStanding() && player->actionManager->getCurrentAction()->scripted,
+						(std::string("scripted action actually starts, even with zero resources: ") + command).c_str()) && ok;
+				}
+				gameManager.inEvent = false;
+				for (int frame = 0; frame < 600 && !player->isStanding(); ++frame)
+				{
+					player->advance();
+				}
+				const bool movement = std::string(command).find("8,8") != std::string::npos;
+				const bool casting = std::string(command).find("magic") != std::string::npos
+					|| std::string(command).find(",8,6,6") != std::string::npos;
+				ok = check(player->isStanding() && !player->actionManager->getCurrentAction()->scripted
+					&& player->mana == resources && player->thew == resources
+					&& (!movement || player->getPosition() == Point{ 8, 8 })
+					&& (!casting || !gameManager.effectManager->effectList.empty()),
+					(std::string("scripted actions complete without resource costs, including after return: ")
+						+ std::to_string(originalType) + " " + command).c_str()) && ok;
+			}
+		}
+		reset(100);
+		player->beginAttack({ 6, 6 });
+		ok = check(player->thew == 100 - ATTACK_THEW_COST,
+			"ordinary attacks still pay stamina after scripted actions") && ok;
+		reset(100);
+		player->beginJump({ 8, 8 });
+		ok = check(player->thew == 100 - JUMP_THEW_COST,
+			"ordinary jumps still pay stamina after scripted actions") && ok;
+		reset(100);
+		player->beginRun({ 8, 8 });
+		ok = check(player->thew == 100 - RUN_THEW_COST,
+			"ordinary running still pays its initial stamina cost") && ok;
+		player->eventRun();
+		ok = check(player->isStanding() && player->thew < 100 - RUN_THEW_COST,
+			"ordinary running continues to pay stamina per step") && ok;
+		reset(100);
+		player->beginMagic(magicInfo, { 6, 6 });
+		player->eventRun();
+		ok = check(player->mana == 70 && player->thew == 80,
+			"ordinary delayed casting still pays both resource costs") && ok;
+		reset(100);
+		gameManager.scriptAPI.playerRunToEx(8, 8);
+		player->advance();
+		player->beginRun({ 8, 10 });
+		ok = check(!player->actionManager->getCurrentAction()->scripted,
+			"player retargeting replaces the scripted running cost policy") && ok;
+		player->eventRun();
+		ok = check(player->isStanding() && player->thew < 100,
+			"player running after taking over a scripted path consumes stamina") && ok;
+		reset(100);
+		gameManager.scriptAPI.playerRunToEx(8, 8);
+		player->advance();
+		player->beginHurt({ 6, 6 });
+		ok = check(player->isHurting(), "scripted running can be interrupted by a normal hurt action") && ok;
+		player->eventRun();
+		ok = check(player->isStanding() && player->getPosition() == Point{ 8, 8 } && player->thew == 100,
+			"resuming scripted running after being hurt retains its cost policy") && ok;
+		reset(100);
+		gameManager.inEvent = true;
+		player->beginAttack({ 6, 6 });
+		ok = check(player->thew == 100 - ATTACK_THEW_COST,
+			"an unrelated running script does not exempt an ordinary attack") && ok;
+		gameManager.inEvent = false;
+		reset(0);
+		player->beginAttack({ 6, 6 });
+		player->beginJump({ 8, 8 });
+		player->beginRun({ 8, 8 });
+		ok = check(player->isStanding() && !player->canPayRunThewCost()
+			&& !player->tryConsumeMagicCost(magic, 1, false),
+			"ordinary actions still reject insufficient resources") && ok;
+		magic->goodsName = "missing-story-cost-item";
+		ok = check(!player->tryConsumeMagicCost(magic, 1, false, true),
+			"scripted casts retain required-item checks") && ok;
+		magic->goodsName.clear();
+		player->canUseMana = false;
+		ok = check(!player->tryConsumeMagicCost(magic, 1, false, true),
+			"scripted casts retain explicit skill-use restrictions") && ok;
+		player->canUseMana = true;
+		magicInfo.remainColdMilliseconds = 1000;
+		player->beginMagic(magicInfo, { 6, 6 }, nullptr, -1, true);
+		ok = check(player->isStanding(), "scripted casting retains cooldown restrictions") && ok;
+		reset(0);
+		magic->level[1].moveKind = mmkSelf;
+		magic->level[1].specialKind = mskClearAbnormalState;
+		gameManager.scriptAPI.useMagic("story_cost.ini", 4, 4, true);
+		ok = check(!gameManager.effectManager->effectList.empty() && player->mana == 0 && player->thew == 0,
+			"immediate self-cure script casts also ignore mana and stamina costs") && ok;
+
+		ResourceManifest freeNormalRun;
+		freeNormalRun.type = originalType;
+		freeNormalRun.features["usethewwhennormalrun"] = false;
+		gameManager.global.applyResourceManifestFeatures(freeNormalRun);
+		for (bool fighting : { false, true })
+		{
+			for (int resources : { 0, 100 })
+			{
+				reset(resources);
+				player->fightState.set(fighting);
+				player->beginRun({ 8, 8 });
+				const bool canRun = !fighting || resources >= RUN_THEW_COST;
+				ok = check(player->isRunning() == canRun,
+					"normal-run exemption allows zero stamina only outside combat") && ok;
+				player->eventRun();
+				ok = check(player->isStanding()
+					&& (!canRun || player->getPosition() == Point{ 8, 8 })
+					&& (fighting && canRun ? player->thew < resources : player->thew == resources),
+					"normal-run exemption applies to the entire path while combat retains step costs") && ok;
+			}
+		}
+		reset(100);
+		player->fightState.set(true);
+		player->beginRun({ 8, 8 });
+		player->fightState.update(10000);
+		player->eventRun();
+		ok = check(player->getPosition() == Point{ 8, 8 } && player->thew == 100 - RUN_THEW_COST,
+			"leaving combat while running stops charging subsequent steps") && ok;
+		reset(0);
+		player->fightState.set(false);
+		player->beginRun({ 8, 8 });
+		player->fightState.set(true);
+		player->eventRun();
+		ok = check(player->isStanding() && player->getPosition() != Point{ 8, 8 } && player->thew == 0,
+			"entering combat rechecks stamina before committing the next running step") && ok;
+	}
+	return ok;
+}
+
+bool runPendingTrapWorldInputTests()
+{
+	GameManager gameManager;
+	gameManager.global.data.canInput = true;
+	gameManager.map->data = std::make_shared<MapData>();
+	gameManager.map->data->head.width = 8;
+	gameManager.map->data->head.height = 8;
+	gameManager.map->data->tile.assign(8, std::vector<MapTile>(8));
+	gameManager.map->createDataMap();
+	gameManager.player->life = 100;
+	gameManager.player->setPosition({ 3, 4 }, false);
+	auto npc = std::make_shared<NPC>();
+	npc->kind = nkNormal;
+	npc->relation = nrNeutral;
+	npc->life = 100;
+	npc->scriptFile = "pending-trap-input-npc.lua";
+	npc->setPosition({ 5, 4 });
+	gameManager.npcManager->npcList.push_back(npc);
+	AEvent talkKey(ET_KEYDOWN, KEY_E, 0, 0);
+	bool ok = check(gameManager.controller->onHandleEvent(talkKey)
+		&& gameManager.player->nextAction != nullptr,
+		"world keyboard interaction is available before a trap is queued");
+	gameManager.player->cancelQueuedInteraction();
+	ScriptTask trapTask;
+	trapTask.type = stTraps;
+	trapTask.scriptName = "pending-trap-input.lua";
+	trapTask.scriptMapName = "pending-trap-input-map";
+	trapTask.trapIndex = 1;
+	gameManager.addScriptTask(trapTask);
+	gameManager.controller->onHandleEvent(talkKey);
+	gameManager.controller->onUpdate();
+	ok = check(!gameManager.inEvent && gameManager.hasPendingTrapScript()
+		&& gameManager.player->nextAction == nullptr
+		&& !gameManager.controller->visible,
+		"a queued trap keeps world keyboard input and virtual controls blocked after the parent script ends") && ok;
+	gameManager.scriptTaskList.clear();
+	gameManager.controller->onUpdate();
+	ok = check(!gameManager.hasPendingTrapScript()
+		&& gameManager.controller->visible
+		&& gameManager.controller->onHandleEvent(talkKey)
+		&& gameManager.player->nextAction != nullptr,
+		"world input resumes after the queued trap is removed") && ok;
+	return ok;
+}
+
+bool runQueuedTrapPlayerDeathTests()
+{
+	const auto root = std::filesystem::temp_directory_path()
+		/ ("jxqy-trap-death-" + std::to_string(
+			std::chrono::steady_clock::now().time_since_epoch().count()));
+	std::error_code error;
+	std::filesystem::create_directories(root, error);
+	if (!check(!error, "queued trap death test creates an isolated script root"))
+	{
+		return false;
+	}
+	struct RestoreResourceRoot
+	{
+		std::string previousRoot;
+		std::filesystem::path temporaryRoot;
+		~RestoreResourceRoot()
+		{
+			File::setActiveResourceRoot(previousRoot);
+			std::error_code error;
+			std::filesystem::remove_all(temporaryRoot, error);
+		}
+	} restoreRoot{ File::getActiveResourceRoot(), root };
+	File::setActiveResourceRoot(root.u8string());
+	const auto writeScript = [](const std::string& name, const std::string& source)
+	{
+		return File::writeFileChecked("script/map/trap-death/" + name,
+			source.data(), static_cast<int>(source.size()));
+	};
+	if (!check(writeScript("first.lua", "assign('FirstTrapStarted',1); test_queue_player_death();")
+		&& writeScript("death.lua", "assign('PlayerDeathHandled',1);")
+		&& writeScript("second.lua", "assign('SecondTrapStarted',1);"),
+		"queued trap death test writes both captured traps and the player death script"))
+	{
+		return false;
+	}
+	GameManager gameManager;
+	gameManager.varList.ensureInitialized();
+	gameManager.mapFolderName = "trap-death";
+	gameManager.player->deathScript = "death.lua";
+	ScriptEngineRuntimeTestAccess::registerPlayerDeathTrigger(gameManager.script);
+	for (int index = 1; index <= 2; ++index)
+	{
+		ScriptTask task;
+		task.type = stTraps;
+		task.trapIndex = index;
+		task.scriptMapName = "trap-death";
+		task.scriptName = index == 1 ? "first.lua" : "second.lua";
+		gameManager.addScriptTask(task);
+	}
+	gameManager.runScriptTaskList();
+	const int first = gameManager.varList.getInteger("FirstTrapStarted");
+	const int death = gameManager.varList.getInteger("PlayerDeathHandled");
+	const int second = gameManager.varList.getInteger("SecondTrapStarted");
+	std::cout << "Queued trap death dispatch: first=" << first
+		<< " death=" << death << " second=" << second << '\n';
+	return check(first == 1 && death == 1 && second == 0
+		&& gameManager.varList.getInteger("ActiveBatchBlocksInput") == 1
+		&& !gameManager.hasPendingTrapScript(),
+		"player death handled inside the first trap cancels the remaining local trap batch and releases its input barrier");
+}
+
+bool runScriptPositionTrapTests()
+{
+	const auto root = std::filesystem::temp_directory_path()
+		/ ("jxqy-script-position-trap-" + std::to_string(
+			std::chrono::steady_clock::now().time_since_epoch().count()));
+	std::error_code error;
+	std::filesystem::create_directories(root, error);
+	if (!check(!error, "script-position traps create an isolated script root")) return false;
+	struct RestoreResourceRoot
+	{
+		std::string previousRoot;
+		std::filesystem::path temporaryRoot;
+		~RestoreResourceRoot()
+		{
+			File::setActiveResourceRoot(previousRoot);
+			std::error_code error;
+			std::filesystem::remove_all(temporaryRoot, error);
+		}
+	} restoreRoot{ File::getActiveResourceRoot(), root };
+	File::setActiveResourceRoot(root.u8string());
+	const auto writeScript = [](const std::string& name, const std::string& source)
+	{
+		return File::writeFileChecked("script/map/script-position-trap/" + name,
+			source.data(), static_cast<int>(source.size()));
+	};
+	if (!check(writeScript("first.lua",
+		"assign('FirstTrapCount',getvar('FirstTrapCount')+1); assign('ParentSeenByTrap',getvar('ParentFinished'));")
+		&& writeScript("second.lua", "assign('SecondTrapCount',getvar('SecondTrapCount')+1);")
+		&& writeScript("parallel.lua", "setplayerpos(3,4); sleep(1); assign('ParentFinished',1);"),
+		"script-position traps write their actual Lua callbacks")) return false;
+
+	bool ok = true;
+	for (const int originalType : { GAME_JXQY2, GAME_YYCS, GAME_XJXQY })
+	{
+		GameManager gameManager;
+		applyOriginalBehavior(gameManager.global, originalType);
+		gameManager.varList.ensureInitialized();
+		gameManager.mapFolderName = "script-position-trap";
+		gameManager.global.data.mapName = "script-position-trap.map";
+		gameManager.map->data = std::make_shared<MapData>();
+		gameManager.map->data->head.width = 8;
+		gameManager.map->data->head.height = 8;
+		gameManager.map->data->tile.assign(8, std::vector<MapTile>(8));
+		gameManager.map->data->tile[4][3].trap = 1;
+		gameManager.map->data->tile[4][5].trap = 2;
+		gameManager.map->createDataMap();
+		gameManager.player->npcName = "landing-player";
+		const auto update = [&]() { ScriptEngineRuntimeTestAccess::updateGameManager(gameManager); };
+		const auto reset = [&]()
+		{
+			gameManager.scriptTaskList.clear();
+			gameManager.inEvent = false;
+			gameManager.global.data.mapName = "script-position-trap.map";
+			gameManager.mapFolderName = "script-position-trap";
+			gameManager.player->life = 100;
+			gameManager.player->result = 0;
+			gameManager.player->actionManager->resetActionIgnoringTransitions(acStand);
+			gameManager.player->setPosition({ 1, 1 }, false);
+			gameManager.player->cancelPendingScriptPositionTrap();
+			gameManager.scriptAPI.setMapTrap(1, "first.lua");
+			gameManager.scriptAPI.setMapTrap(2, "second.lua");
+			for (const char* variable : { "FirstTrapCount", "SecondTrapCount", "ParentFinished",
+				"ParentSeenByTrap", "QueuedDuringParent", "TrapRanDuringParent", "ParallelWasRunning" })
+			{
+				gameManager.varList.setInteger(variable, 0);
+			}
+		};
+		const auto count = [&](const char* variable) { return gameManager.varList.getInteger(variable); };
+		ScriptEngineRuntimeTestAccess::registerScriptProbe(gameManager.script, "test_update_landing", [](lua_State*)
+		{
+			ScriptEngineRuntimeTestAccess::updateGameManager(*gm);
+			ScriptEngineRuntimeTestAccess::updateGameManager(*gm);
+			gm->varList.setInteger("QueuedDuringParent", static_cast<int>(gm->scriptTaskList.size()));
+			gm->varList.setInteger("TrapRanDuringParent", gm->varList.getInteger("FirstTrapCount"));
+			return 0;
+		});
+		for (const char* setter : { "setplayerpos(3,4)", "setplayerpos('landing-player',3,4)" })
+		{
+			reset();
+			gameManager.inEvent = true;
+			ok = check(ScriptEngineRuntimeTestAccess::execute(gameManager.script, setter) == LUA_OK
+				&& gameManager.player->getPosition() == Point{ 3, 4 }
+				&& gameManager.scriptTaskList.empty() && count("FirstTrapCount") == 0,
+				"both SetPlayerPos forms defer landing traps until the next manager update in all three profiles") && ok;
+			update();
+			update();
+			ok = check(gameManager.scriptTaskList.size() == 1
+				&& gameManager.scriptTaskList.front().type == stTraps
+				&& gameManager.scriptTaskList.front().trapIndex == 1
+				&& gameManager.scriptTaskList.front().scriptMapName == "script-position-trap"
+				&& gameManager.scriptTaskList.front().scriptName == "first.lua"
+				&& count("FirstTrapCount") == 0 && gameManager.traps.hasTriggered(1),
+				"real manager updates capture the landing trap exactly once while its parent event is active") && ok;
+			gameManager.varList.setInteger("ParentFinished", 1);
+			gameManager.inEvent = false;
+			update();
+			update();
+			gameManager.player->checkTrap();
+			ok = check(count("FirstTrapCount") == 1 && count("ParentSeenByTrap") == 1
+				&& gameManager.scriptTaskList.empty(),
+				"captured landing trap executes after its parent event and does not repeat on the same tile") && ok;
+			gameManager.scriptAPI.setMapTrap(1, "first.lua");
+			ok = check(ScriptEngineRuntimeTestAccess::execute(gameManager.script, setter) == LUA_OK,
+				"an explicit same-tile placement can be issued after rebinding") && ok;
+			update();
+			ok = check(count("FirstTrapCount") == 2 && gameManager.scriptTaskList.empty(),
+				"rearming and explicitly placing the player again on the same tile triggers once in a normal frame") && ok;
+		}
+
+		reset();
+		gameManager.inEvent = true;
+		ok = check(ScriptEngineRuntimeTestAccess::execute(gameManager.script,
+			"setplayerpos(3,4); test_update_landing(); assign('ParentFinished',1);") == LUA_OK
+			&& count("QueuedDuringParent") == 1 && count("TrapRanDuringParent") == 0,
+			"an active Lua parent can pump manager frames without executing its landing trap recursively") && ok;
+		gameManager.inEvent = false;
+		update();
+		ok = check(count("FirstTrapCount") == 1 && count("ParentSeenByTrap") == 1,
+			"the actual parent Lua continuation completes before the landing callback") && ok;
+
+		reset();
+		// Replace only wall-clock waiting with two real manager updates.
+		ScriptEngineRuntimeTestAccess::registerScriptProbe(gameManager.script, "sleep", [](lua_State*)
+		{
+			gm->varList.setInteger("ParallelWasRunning", !gm->inEvent && gm->script.running ? 1 : 0);
+			ScriptEngineRuntimeTestAccess::updateGameManager(*gm);
+			ScriptEngineRuntimeTestAccess::updateGameManager(*gm);
+			gm->varList.setInteger("QueuedDuringParent", static_cast<int>(gm->scriptTaskList.size()));
+			gm->varList.setInteger("TrapRanDuringParent", gm->varList.getInteger("FirstTrapCount"));
+			return 0;
+		});
+		ScriptTask parallel;
+		parallel.type = stScript;
+		parallel.scriptName = "parallel.lua";
+		parallel.scriptMapName = gameManager.mapFolderName;
+		gameManager.addScriptTask(parallel);
+		update();
+		ok = check(count("ParallelWasRunning") == 1 && count("QueuedDuringParent") == 1
+			&& count("TrapRanDuringParent") == 0 && count("ParentFinished") == 1,
+			"a parallel SetPlayerPos/sleep/assign parent defers landing dispatch even without inEvent") && ok;
+		update();
+		ok = check(count("FirstTrapCount") == 1 && count("ParentSeenByTrap") == 1,
+			"the parallel parent's continuation runs before its captured landing trap") && ok;
+
+		reset();
+		ScriptEngineRuntimeTestAccess::execute(gameManager.script, "setplayerpos(3,4); setplayerpos(5,4);");
+		update();
+		ok = check(count("FirstTrapCount") == 0 && count("SecondTrapCount") == 1
+			&& !gameManager.traps.hasTriggered(1),
+			"consecutive script placements inspect only the final landing") && ok;
+
+		for (int cancellation = 0; cancellation < 4; ++cancellation)
+		{
+			reset();
+			gameManager.scriptAPI.setPlayerPosition(3, 4);
+			if (cancellation == 0) gameManager.player->setPosition({ 1, 1 }, false);
+			if (cancellation == 1) gameManager.global.data.mapName = "another-map.map";
+			if (cancellation == 2) gameManager.player->life = 0;
+			if (cancellation == 3) gameManager.player->result |= erRunDeathScript;
+			update();
+			gameManager.global.data.mapName = "script-position-trap.map";
+			gameManager.player->life = 100;
+			gameManager.player->setPosition({ 3, 4 }, false);
+			update();
+			ok = check(count("FirstTrapCount") == 0 && gameManager.scriptTaskList.empty()
+				&& !gameManager.traps.hasTriggered(1),
+				"movement, map changes, zero life and death dispatch consume stale landings without replay after return") && ok;
+		}
+
+		reset();
+		gameManager.global.data.canInput = true;
+		auto interactionNpc = std::make_shared<NPC>();
+		interactionNpc->kind = nkNormal;
+		interactionNpc->relation = nrNeutral;
+		interactionNpc->life = 100;
+		interactionNpc->scriptFile = "input-must-wait.lua";
+		interactionNpc->setPosition({ 5, 4 }, false);
+		gameManager.npcManager->npcList.push_back(interactionNpc);
+		gameManager.player->setPosition({ 3, 4 }, false);
+		AEvent talkKey(ET_KEYDOWN, KEY_E, 0, 0);
+		ok = check(gameManager.controller->onHandleEvent(talkKey)
+			&& gameManager.player->nextAction != nullptr,
+			"world interaction is available before a script landing is pending") && ok;
+		gameManager.player->cancelQueuedInteraction();
+		gameManager.scriptAPI.setPlayerPosition(3, 4);
+		gameManager.controller->onHandleEvent(talkKey);
+		gameManager.controller->onUpdate();
+		ok = check(gameManager.hasPendingTrapScript() && gameManager.scriptTaskList.empty()
+			&& gameManager.player->nextAction == nullptr && !gameManager.controller->visible,
+			"pending script placement blocks world input before the manager can capture its trap") && ok;
+		gameManager.npcManager->npcList.clear();
+
+		reset();
+		gameManager.scriptAPI.setPlayerPosition(3, 4);
+		gameManager.player->suppressTrapAtScriptPosition();
+		update();
+		gameManager.player->checkTrap();
+		ok = check(count("FirstTrapCount") == 0 && !gameManager.traps.hasTriggered(1),
+			"explicit editor-run suppression cancels a pending landing and remains active on that tile") && ok;
+		gameManager.player->setPosition({ 5, 4 }, false);
+		gameManager.player->checkTrap();
+		ok = check(count("SecondTrapCount") == 1,
+			"leaving an explicitly suppressed editor tile restores ordinary trap contact") && ok;
+		reset();
+		gameManager.scriptAPI.setPlayerPosition(3, 4);
+		gameManager.scriptAPI.freeMap();
+		update();
+		ok = check(gameManager.map->data == nullptr && !gameManager.hasPendingTrapScript()
+			&& count("FirstTrapCount") == 0,
+			"FreeMap cancels a pending landing even though the logical map name is retained") && ok;
+	}
+	return ok;
+}
+
+bool runSwordTwoScriptLandingTrapTests()
+{
+	const auto packRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path()
+		/ "assets" / "jxqy2";
+	if (!std::filesystem::exists(packRoot / "game_profile.ini"))
+	{
+		std::cout << "SKIP: optional Sword2 script landing resources are absent\n";
+		return true;
+	}
+	struct RestoreSettings
+	{
+		std::string resourceRoot = File::getActiveResourceRoot();
+		std::string saveNamespace = File::getActiveSaveNamespace();
+		bool loadAsync = Config::loadAsync;
+		bool automaticSave = Config::automaticSaveEnabled;
+		~RestoreSettings()
+		{
+			File::setActiveResourceRoot(resourceRoot);
+			File::setActiveSaveNamespace(saveNamespace);
+			Config::loadAsync = loadAsync;
+			Config::automaticSaveEnabled = automaticSave;
+		}
+	} restoreSettings;
+	File::setActiveResourceRoot(packRoot.u8string());
+	File::setActiveSaveNamespace("script-landing-test-" + std::to_string(
+		std::chrono::steady_clock::now().time_since_epoch().count()));
+	Config::loadAsync = false;
+	Config::automaticSaveEnabled = false;
+
+	class LandingPlayer final : public Player
+	{
+	public:
+		using Element::onUpdate;
+		bool movementTimedOut = false;
+	private:
+		void onRun() override
+		{
+			// Run the real Player path and animation updates on a bounded clock.
+			for (int frame = 0; frame < 800 && logicRunning; ++frame)
+			{
+				gm->setTime(gm->getTime() + 50);
+				setTime(getTime() + 50);
+				frameTime = 50;
+				onUpdate();
+				ScriptEngineRuntimeTestAccess::updateGameManager(*gm);
+			}
+			if (logicRunning)
+			{
+				movementTimedOut = true;
+				result |= erInitError;
+				logicRunning = false;
+			}
+		}
+	};
+	class LandingDialog final : public Dialog
+	{
+	public:
+		int confirmations = 0;
+	private:
+		void onRun() override
+		{
+			++confirmations;
+			logicRunning = false;
+		}
+	};
+	GameManager gameManager;
+	ResourceManifest manifest;
+	if (!check(manifest.loadFromFile("game_profile.ini"), "Sword2 landing test reads the actual pack profile")) return false;
+	gameManager.global.applyResourceManifestFeatures(manifest);
+	gameManager.varList.ensureInitialized();
+	auto player = std::make_shared<LandingPlayer>();
+	gameManager.controller->removeChild(gameManager.player);
+	gameManager.player = player;
+	gameManager.npcManager->setPlayer(player);
+	gameManager.controller->addChild(player);
+	auto dialog = std::make_shared<LandingDialog>();
+	gameManager.menu->dialog = dialog;
+	if (!check(player->loadInitialTemplate(-1) && gameManager.traps.loadInitialTemplate()
+		&& gameManager.scriptAPI.loadMap(u8"狂沙镇.map", false),
+		"Sword2 landing test loads the actual player, trap bindings and departure map")) return false;
+	for (const char* command : { "fadeout", "fadein", "playmusic", "stopmusic", "showmessage", "savenpc", "saveobj" })
+	{
+		// Presentation and departure snapshots are outside this landing contract.
+		ScriptEngineRuntimeTestAccess::registerScriptProbe(gameManager.script, command, [](lua_State*) { return 0; });
+	}
+	ScriptEngineRuntimeTestAccess::registerScriptProbe(gameManager.script, "talk", [](lua_State* state)
+	{
+		const std::string part = lua_tostring(state, 1);
+		if (part == "NotOut")
+		{
+			gm->varList.setInteger("NotOutReached", gm->varList.getInteger("NotOutReached") + 1);
+			gm->varList.setInteger("NotOutSettled", gm->player->getPosition() == Point{ 8, 84 }
+				&& gm->player->isStanding() ? 1 : 0);
+		}
+		gm->scriptAPI.talk(part);
+		return 0;
+	});
+	gameManager.varList.setInteger("KsOQieHuan", 1);
+	gameManager.runTrapScript(3);
+	bool ok = check(gameManager.mapFolderName == u8"狂沙镇-铁门寨"
+		&& gameManager.global.data.mapName == u8"狂沙镇-铁门寨.map"
+		&& gameManager.global.data.npcName == "ks-tmz.npc"
+		&& gameManager.global.data.objName == "ks-tmz.obj"
+		&& player->getPosition() == Point{ 8, 90 }
+		&& gameManager.map->getTrapIndex({ 8, 90 }) == 1
+		&& gameManager.traps.get(gameManager.mapFolderName, 1) == u8"地图切换.txt"
+		&& gameManager.hasPendingTrapScript() && gameManager.varList.getInteger("NotOutReached") == 0,
+		"actual Kuangsha exit loads the wilderness and schedules its bound landing at (8,90)");
+	ScriptEngineRuntimeTestAccess::updateGameManager(gameManager);
+	ok = check(!player->movementTimedOut && player->getPosition() == Point{ 8, 84 }
+		&& gameManager.varList.getInteger("NotOutReached") == 1
+		&& gameManager.varList.getInteger("NotOutSettled") == 1 && dialog->confirmations == 1
+		&& !gameManager.hasPendingTrapScript(),
+		"actual landing script walks to (8,84) before presenting and confirming the NotOut dialogue") && ok;
+	ScriptEngineRuntimeTestAccess::updateGameManager(gameManager);
+	ok = check(gameManager.varList.getInteger("NotOutReached") == 1,
+		"rearmed wilderness exit does not replay without another contact or explicit placement") && ok;
+
+	gameManager.scriptAPI.setPlayerPosition(8, 90);
+	ok = check(gameManager.scriptAPI.loadMap(u8"狂沙镇-铁门寨.map", false),
+		"the same production map can be loaded again while a landing is pending") && ok;
+	ScriptEngineRuntimeTestAccess::updateGameManager(gameManager);
+	ok = check(!gameManager.hasPendingTrapScript() && gameManager.varList.getInteger("NotOutReached") == 1,
+		"successfully reloading the same map cancels the previous generation's pending landing") && ok;
+	return ok;
+}
+
+bool runStoryTimerTests()
+{
+	const auto root = std::filesystem::temp_directory_path()
+		/ ("jxqy-story-timer-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+	std::error_code error;
+	std::filesystem::create_directories(root, error);
+	if (!check(!error, "story timer creates its isolated resource root")) return false;
+	struct RestoreResourceRoot
+	{
+		std::string previousRoot;
+		std::filesystem::path temporaryRoot;
+		~RestoreResourceRoot()
+		{
+			File::setActiveResourceRoot(previousRoot);
+			std::error_code error;
+			std::filesystem::remove_all(temporaryRoot, error);
+		}
+	} restoreRoot{ File::getActiveResourceRoot(), root };
+	File::setActiveResourceRoot(root.u8string());
+	const std::string callback = "assign('TimerCallbacks',getvar('TimerCallbacks')+1);";
+	if (!check(File::writeFileChecked("script/common/timer-expired.lua", callback.data(),
+		static_cast<int>(callback.size())), "story timer writes an isolated timeout callback")) return false;
+	bool ok = true;
+	for (const int originalType : { GAME_JXQY2, GAME_YYCS, GAME_XJXQY })
+	{
+		GameManager gameManager;
+		applyOriginalBehavior(gameManager.global, originalType);
+		gameManager.varList.ensureInitialized();
+		gameManager.scriptAPI.setTimeScript(0, "timer-expired.lua");
+		gameManager.scriptAPI.openTimeLimit(2);
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 250);
+		ScriptEngineRuntimeTestAccess::registerScriptProbe(gameManager.script, "test_story_frame", [](lua_State*)
+		{
+			ScriptEngineRuntimeTestAccess::advanceGameManager(*gm, 5000);
+			return 0;
+		});
+		const int scriptResult = ScriptEngineRuntimeTestAccess::execute(gameManager.script, "test_story_frame();");
+		ok = check(scriptResult == LUA_OK && gameManager.timerSeconds == 2
+			&& gameManager.timerAccumulated == 250 && gameManager.varList.getInteger("TimerCallbacks") == 0,
+			"a running Lua story cannot consume timer time or nest the timeout callback") && ok;
+		gameManager.inEvent = true;
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 5000);
+		gameManager.inEvent = false;
+		ok = check(gameManager.timerSeconds == 2 && gameManager.timerAccumulated == 250,
+			"story event waits preserve remaining seconds and the partial second") && ok;
+		ScriptTask trap;
+		trap.type = stTraps;
+		trap.remainingMilliseconds = 1000;
+		gameManager.addScriptTask(trap);
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 250);
+		ok = check(gameManager.timerSeconds == 2 && gameManager.timerAccumulated == 250,
+			"a pending story trap prevents the timer from overtaking its dispatch") && ok;
+		gameManager.scriptTaskList.clear();
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 750);
+		ok = check(gameManager.timerSeconds == 1 && gameManager.timerAccumulated == 0,
+			"idle gameplay resumes the timer without charging time spent in the story") && ok;
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 1000);
+		ScriptEngineRuntimeTestAccess::advanceGameManager(gameManager, 1000);
+		ok = check(!gameManager.timerStarted && !gameManager.timeScriptSet
+			&& gameManager.timerSeconds == 0 && gameManager.varList.getInteger("TimerCallbacks") == 1,
+			"unpaused gameplay reaches zero and executes its timeout callback exactly once") && ok;
+	}
+	return ok;
+}
+
+bool runScriptEngineRuntimeTests()
+{
+	bool ok = true;
+	ok = check(
+		resolveMoveScreenArgumentMode(2) ==
+			MoveScreenArgumentMode::Distance,
+		"two-argument MoveScreen uses the original JXQY2 distance protocol") && ok;
+	ok = check(
+		resolveMoveScreenArgumentMode(3) ==
+			MoveScreenArgumentMode::FrameCountAndSpeed &&
+		resolveMoveScreenArgumentMode(4) ==
+			MoveScreenArgumentMode::FrameCountAndSpeed,
+		"three-or-more-argument MoveScreen uses the JxqyHD frame-count protocol") && ok;
+	ok = runScriptLibraryProfileTests() && ok;
+	ok = runExactScriptDiagnosticTests() && ok;
+	ok = runRuntimeTraceInstrumentationTests() && ok;
+	ok = runGoodsUseWithoutMenusTests() && ok;
+	ok = runPlayerForcedMovementUpdateTests() && ok;
+	ok = runPlayerOffsetWalkScriptTests() && ok;
+	ok = runConfiguredPixelRunSpeedTests() && ok;
+	ok = runMgEqualLevelScriptTests() && ok;
+	ok = runPaperScriptTests() && ok;
+	ok = runMiniGameScriptTests() && ok;
+	ok = runScriptActionResourceCostTests() && ok;
+	ok = runPendingTrapWorldInputTests() && ok;
+	ok = runQueuedTrapPlayerDeathTests() && ok;
+	ok = runScriptPositionTrapTests() && ok;
+	ok = runSwordTwoScriptLandingTrapTests() && ok;
+	ok = runStoryTimerTests() && ok;
+	Script script;
+
+	for (int index = 0; index < 4096; index++)
+	{
+		const int result = ScriptEngineRuntimeTestAccess::execute(script, "return 123");
+		ok = check(result == LUA_OK && ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+			"repeated top-level script returns do not accumulate on the shared Lua stack") && ok;
+		if (!ok)
+		{
+			break;
+		}
+	}
+
+	const int syntaxResult = ScriptEngineRuntimeTestAccess::execute(script, "local =");
+	ok = check(syntaxResult != LUA_OK && ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"syntax errors restore the shared Lua stack") && ok;
+
+	const int runtimeResult = ScriptEngineRuntimeTestAccess::execute(script, "error('expected failure')");
+	ok = check(runtimeResult != LUA_OK && ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"runtime errors restore the shared Lua stack") && ok;
+
+	const int malformedStringResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"printf(nil); printf({}); return true");
+	ok = check(malformedStringResult == LUA_OK && ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"non-string Lua arguments are converted without null string construction") && ok;
+
+	ScriptEngineRuntimeTestAccess::registerNestedRunner(script);
+	const int nestedResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"assert(test_run_nested('first', 'second') == 2); return 'outer-result'");
+	ok = check(nestedResult == LUA_OK && ScriptEngineRuntimeTestAccess::nestedStackWasPreserved()
+		&& ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"nested script execution preserves the caller stack and discards unused chunk returns") && ok;
+
+	GameManager gameManager;
+	gameManager.varList.ensureInitialized();
+	gameManager.map->data = std::make_shared<MapData>();
+	gameManager.map->data->head.width = 8;
+	gameManager.map->data->head.height = 8;
+	gameManager.map->data->tile.assign(8, std::vector<MapTile>(8));
+	gameManager.map->createDataMap();
+	ok = runScriptPlayerNameTests(gameManager) && ok;
+	const int outputVariableResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"assign('Exp',42); assign('exp',17); "
+		"assign('Space',99); assign('MagicSpace',99); "
+		"assign('Weapon',99); assign('PlayerLife',-1); "
+		"getexp('Exp'); checkfreegoodsspace('Space'); "
+		"checkfreemagicspace('MagicSpace'); isequipweapon('Weapon'); "
+		"getplayerstate('Life','PlayerLife'); "
+		"assert(getvar('Exp') == getplayerexp()); "
+		"assert(getvar('exp') == 17); "
+		"assert(getvar('Space') == hasgoodsfreespace()); "
+		"assert(getvar('MagicSpace') == hasmagicfreespace()); "
+		"assert(getvar('Weapon') == 0 or getvar('Weapon') == 1)");
+	ok = check(outputVariableResult == LUA_OK &&
+		gameManager.varList.getInteger("PlayerLife") == gameManager.player->life,
+		"converted output arguments write exact-case variable names through real Lua APIs") && ok;
+	const int quotedCounterResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"assign('CuiYanMen2DiZi',0); assign('cuiyanmen2dizi',19); "
+		"for i = 1, 6 do add('CuiYanMen2DiZi',1) end; "
+		"assert(getvar('CuiYanMen2DiZi') == 6); "
+		"assert(getvar('cuiyanmen2dizi') == 19); "
+		"assert(getvar('$CuiYanMen2DiZi') == 0)");
+	ok = check(quotedCounterResult == LUA_OK,
+		"repaired JXQY2 quoted variables accumulate in the same exact name read by story conditions") && ok;
+	const int keepVariableResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"assign('Kept',121); clearallvar('Exp','exp','Kept'); "
+		"assert(getvar('exp') == 17 and getvar('Kept') == 121); "
+		"assert(getvar('Space') == 0 and getvar('Weapon') == 0); "
+		"clearallvars('Kept'); "
+		"assert(getvar('exp') == 0 and getvar('Kept') == 121); "
+		"clearallvar()");
+	ok = check(keepVariableResult == LUA_OK,
+		"converted keep lists and ClearAllVars alias retain names rather than their values") && ok;
+	gameManager.memo.clear();
+	const int goodsQueryIndex = gameManager.goodsManager.storeBegin();
+	const GoodsInfo savedGoodsQueryInfo =
+		gameManager.goodsManager.goodsList[goodsQueryIndex];
+	gameManager.goodsManager.goodsList[goodsQueryIndex].goods =
+		std::make_shared<Goods>();
+	gameManager.goodsManager.goodsList[goodsQueryIndex].goods->name =
+		"CasePotion";
+	gameManager.goodsManager.goodsList[goodsQueryIndex].number = 3;
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "getgoodsnumbyname('casepotion')");
+	ok = check(gameManager.varList.getInteger("GoodsNum") == 3,
+		"GetGoodsNumByName uses the C++ case-insensitive display-name lookup") && ok;
+	gameManager.goodsManager.goodsList[goodsQueryIndex] = savedGoodsQueryInfo;
+	const int secondGoodsQueryIndex = goodsQueryIndex + 1;
+	const GoodsInfo savedSecondGoodsQueryInfo =
+		gameManager.goodsManager.goodsList[secondGoodsQueryIndex];
+	gameManager.goodsManager.goodsList[goodsQueryIndex].iniFile =
+		u8"goods-e12-银丝草.ini";
+	gameManager.goodsManager.goodsList[goodsQueryIndex].number = 5;
+	gameManager.goodsManager.goodsList[secondGoodsQueryIndex].iniFile =
+		u8"GOODS-E12-银丝草.INI";
+	gameManager.goodsManager.goodsList[secondGoodsQueryIndex].number = 7;
+	ScriptEngineRuntimeTestAccess::execute(
+		script, u8"getgoodsnum('goods-e12-银丝草.ini')");
+	ok = check(gameManager.varList.getInteger("GoodsNum") == 12,
+		"GetGoodsNum aggregates a YYCS quest item across separate inventory slots") && ok;
+	gameManager.goodsManager.goodsList[goodsQueryIndex].goods =
+		std::make_shared<Goods>();
+	gameManager.goodsManager.goodsList[goodsQueryIndex].goods->name = "CasePotion";
+	gameManager.goodsManager.goodsList[secondGoodsQueryIndex].goods =
+		gameManager.goodsManager.goodsList[goodsQueryIndex].goods;
+	const int goodsDeletionResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		u8"delgoods('GOODS-E12-银丝草.INI'); "
+		"delgoodbyname('casepotion',6); getgoodsnumbyname('CasePotion'); "
+		"assert(getvar('GoodsNum') == 5); "
+		"delgoodbyname('CasePotion'); getgoodsnumbyname('casepotion'); "
+		"assert(getvar('GoodsNum') == 0)");
+	ok = check(goodsDeletionResult == LUA_OK,
+		"DelGoods removes one item, while DelGoodByName spans slots and defaults to all") && ok;
+	GoodsInfo& equipProbe = gameManager.goodsManager.goodsList[goodsQueryIndex];
+	equipProbe.iniFile = "equip_command_drug_probe.ini";
+	equipProbe.number = 2;
+	equipProbe.goods = std::make_shared<Goods>();
+	equipProbe.goods->kind = gkDrug;
+	const std::string equipProbeScript =
+		"equipgoods(" + std::to_string(goodsQueryIndex + 1) + ",999)";
+	const int equipProbeResult = ScriptEngineRuntimeTestAccess::execute(
+		script, equipProbeScript);
+	ok = check(equipProbeResult == LUA_OK && equipProbe.number == 1,
+		"characterization: EquipGoods currently consumes a non-equipment drug regardless of part") && ok;
+	gameManager.goodsManager.goodsList[goodsQueryIndex] = savedGoodsQueryInfo;
+	gameManager.goodsManager.goodsList[secondGoodsQueryIndex] =
+		savedSecondGoodsQueryInfo;
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "memo('123'); delmemo('123')");
+	ok = check(gameManager.memo.memo.empty(),
+		"DelMemo removes literal numeric text instead of treating it as a talk-text index") && ok;
+	gameManager.varList.setInteger("after_negative_sleep", 0);
+	gameManager.global.data.canInput = true;
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "sleep(-1); assign('after_negative_sleep', 1)");
+	ok = check(gameManager.varList.getInteger("after_negative_sleep") == 1
+		&& gameManager.global.data.canInput,
+		"non-positive Sleep completes immediately without unsigned wraparound") && ok;
+	const int preconfiguredTimerResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"settimescript(0, 'production-timeout.lua'); "
+		"opentimelimit(60); hidetimerwnd()");
+	ok = check(preconfiguredTimerResult == LUA_OK
+		&& gameManager.timerStarted
+		&& gameManager.timerHidden
+		&& gameManager.timerSeconds == 60
+		&& gameManager.timeScriptSet
+		&& gameManager.timeScriptSeconds == 0
+		&& gameManager.timeScriptFileName == "production-timeout.lua",
+		"SetTimeScript before OpenTimeLimit preserves the XJXQY production timeout callback") && ok;
+	gameManager.scriptAPI.closeTimeLimit();
+	ok = check(!gameManager.timerStarted && !gameManager.timeScriptSet,
+		"CloseTimeLimit clears the active timer and its callback") && ok;
+	const int signedRandomResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"for i = 1, 200 do "
+		"  getrandnum('signed_random', -5, -3); "
+		"  local value = getvar('signed_random'); "
+		"  assert(value >= -5 and value <= -3); "
+		"end");
+	ok = check(signedRandomResult == LUA_OK,
+		"GetRandNum preserves the YYCS/XJXQY signed inclusive range") && ok;
+	const int randomBoundaryResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"getrandnum('RandomCase',7,7,0); getrandnum('randomcase',-7,-7); "
+		"getrandnum('reversed_random',9,4); "
+		"getrandnum('maximum_random',2147483647,2147483647); "
+		"getrandnum('minimum_random',-2147483648,-2147483648); "
+		"assert(getvar('RandomCase') == 7 and getvar('randomcase') == -7); "
+		"assert(getvar('reversed_random') >= 4 and getvar('reversed_random') <= 9); "
+		"assert(getvar('maximum_random') == 2147483647 and getvar('minimum_random') == -2147483648)");
+	ok = check(randomBoundaryResult == LUA_OK,
+		"GetRandNum keeps case-sensitive output names, extra-argument compatibility, and safe integer endpoints") && ok;
+	ScriptEngineRuntimeTestAccess::registerQuitRequester(script);
+	gameManager.varList.setInteger("after_generic_quit", 0);
+	const int genericQuitResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"test_request_application_quit(); assign('after_generic_quit', 1)");
+	ok = check(genericQuitResult != LUA_OK &&
+		gameManager.varList.getInteger("after_generic_quit") == 0 &&
+		ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"application quit from any blocking Lua API aborts the remaining chunk") && ok;
+	Element::resetApplicationQuitState();
+
+	const bool savedUseWav = gameManager.global.useWav;
+	for (const bool useWav : { false, true })
+	{
+		gameManager.global.useWav = useWav;
+		gameManager.global.data.bgmName = "existing-theme.mp3";
+		ScriptEngineRuntimeTestAccess::setCurrentBgmName(gameManager, "existing-theme.mp3");
+		const int missingMusicArgument = ScriptEngineRuntimeTestAccess::execute(script, "playmusic()");
+		ok = check(missingMusicArgument == LUA_OK
+			&& gameManager.global.data.bgmName == "existing-theme.mp3"
+			&& ScriptEngineRuntimeTestAccess::currentBgmName(gameManager) == "existing-theme.mp3",
+			"PlayMusic without arguments preserves the current BGM") && ok;
+		const int emptyMusicArgument = ScriptEngineRuntimeTestAccess::execute(script, "playmusic('')");
+		ok = check(emptyMusicArgument == LUA_OK
+			&& gameManager.global.data.bgmName.empty()
+			&& ScriptEngineRuntimeTestAccess::currentBgmName(gameManager).empty(),
+			"PlayMusic with an empty filename clears BGM without inventing an extension") && ok;
+		gameManager.global.data.bgmName.clear();
+		ScriptEngineRuntimeTestAccess::setCurrentBgmName(gameManager, "previous-map.mp3");
+		gameManager.scriptAPI.playMusic(gameManager.global.data.bgmName);
+		ok = check(gameManager.global.data.bgmName.empty()
+			&& ScriptEngineRuntimeTestAccess::currentBgmName(gameManager).empty(),
+			"restoring an empty saved BGM clears the previous map's music state") && ok;
+	}
+	gameManager.global.useWav = savedUseWav;
+
+	gameManager.varList.setInteger("after_movie_quit", 0);
+	gameManager.global.data.bgmName = "existing-theme.mp3";
+	ScriptEngineRuntimeTestAccess::setCurrentBgmName(
+		gameManager,
+		"existing-theme.mp3");
+	Engine::getInstance()->requestApplicationQuit();
+	const int movieQuitResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"playmovie('missing.avi'); assign('after_movie_quit', 1)");
+	ok = check(movieQuitResult != LUA_OK &&
+		gameManager.varList.getInteger("after_movie_quit") == 0 &&
+		gameManager.global.data.bgmName == "existing-theme.mp3" &&
+		ScriptEngineRuntimeTestAccess::currentBgmName(gameManager) ==
+			"existing-theme.mp3" &&
+		ScriptEngineRuntimeTestAccess::stackTop(script) == 0,
+		"PlayMovie preserves BGM state and application quit aborts the remaining Lua chunk") && ok;
+	Element::resetApplicationQuitState();
+
+	gameManager.global.data.asfStyle = ColorStyle::Grayscale;
+	gameManager.global.data.mpcStyle = ColorStyle::Grayscale;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"changeasfcolor(0, 0, 0); changemapcolor(0, 0, 0)");
+	ok = check(gameManager.global.data.asfStyle == ColorStyle::Grayscale
+		&& gameManager.global.data.mpcStyle == ColorStyle::Grayscale,
+		"ChangeASFColor and ChangeMapColor preserve the legacy zero-color grayscale scene contract") && ok;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"changeasfcolor(12, 34, 56); changemapcolor(65, 43, 21)");
+	ok = check(gameManager.global.data.asfStyle == 0x000C2238
+		&& gameManager.global.data.mpcStyle == 0x00412B15,
+		"ChangeASFColor and ChangeMapColor preserve nonzero RGB colors") && ok;
+	const int colorPlusResult = ScriptEngineRuntimeTestAccess::execute(script, "changemapcolorplus('#2E5C5C')");
+	ok = check(colorPlusResult == LUA_OK && gameManager.global.data.asfStyle == 0x000C2238
+		&& gameManager.global.data.mpcStyle == 0x00412B15 && gameManager.global.data.screenColor == 0x2E5C5C,
+		"MG ChangeMapColorPlus is registered independently of legacy map and sprite colors") && ok;
+	for (const auto& sample : std::vector<std::pair<std::string, uint32_t>>{
+		{ "#2e5c5c", 0x2E5C5C }, { "804020", 0x804020 }, { "#102030ignored", 0x102030 },
+		{ "000000", 0 }, { "#000000", 0xFFFFFF }, { "#FFFFFF", 0xFFFFFF }, { "", 0xFFFFFF } })
+	{
+		const int status = ScriptEngineRuntimeTestAccess::execute(script, "changemapcolorplus('" + sample.first + "')");
+		ok = check(status == LUA_OK && gameManager.global.data.screenColor == sample.second,
+			"MG screen color reads six hexadecimal digits and normalizes explicit reset colors") && ok;
+	}
+	ScriptEngineRuntimeTestAccess::execute(script, "changemapcolorplus('#804020');changemapcolorplus();changemapcolorplus('#12');changemapcolorplus('#GG2233')");
+	ok = check(gameManager.global.data.screenColor == 0x804020,
+		"missing and malformed screen colors preserve the last valid tint") && ok;
+	gameManager.global.data.screenColor = 0xFFFFFF;
+
+	const int savedAttack = gameManager.player->attack;
+	const int savedAttack2 = gameManager.player->attack2;
+	const int savedAttack3 = gameManager.player->attack3;
+	const int savedDefend = gameManager.player->defend;
+	const int savedDefend2 = gameManager.player->defend2;
+	const int savedDefend3 = gameManager.player->defend3;
+	gameManager.player->attack = 1;
+	gameManager.player->attack2 = 2;
+	gameManager.player->attack3 = 3;
+	gameManager.player->defend = 4;
+	gameManager.player->defend2 = 5;
+	gameManager.player->defend3 = 6;
+	gameManager.player->calInfo();
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"addattack(7, 2); addattack(4); addattack(99, 4); "
+		"adddefend(-9, 3); adddefend(3, 2); adddefend(99, 4)");
+	ok = check(gameManager.player->attack == 5
+		&& gameManager.player->attack2 == 9
+		&& gameManager.player->attack3 == 3
+		&& gameManager.player->defend == 4
+		&& gameManager.player->defend2 == 8
+		&& gameManager.player->defend3 == 0,
+		"AddAttack and AddDefend preserve the YYCS/XJXQY type selector and defend clamp") && ok;
+	gameManager.player->attack = savedAttack;
+	gameManager.player->attack2 = savedAttack2;
+	gameManager.player->attack3 = savedAttack3;
+	gameManager.player->defend = savedDefend;
+	gameManager.player->defend2 = savedDefend2;
+	gameManager.player->defend3 = savedDefend3;
+
+	const int savedStateEvade = gameManager.player->evade;
+	const NPCEquipmentAttributes savedEquipmentAttributes =
+		gameManager.player->equipmentAttributes;
+	const auto savedStateGoods = gameManager.goodsManager.goodsList;
+	const auto savedStateMagics = gameManager.magicManager.magicList;
+	for (auto& item : gameManager.goodsManager.goodsList)
+	{
+		item.clear();
+	}
+	for (auto& item : gameManager.magicManager.magicList)
+	{
+		item = {};
+	}
+	const auto savedWeakMagic = gameManager.player->weakMagic;
+	const auto savedMorphMagic = gameManager.player->morphMagic;
+	gameManager.player->attack = 100;
+	gameManager.player->defend = 80;
+	gameManager.player->evade = 60;
+	// NPC template equipment is not the player's live inventory.
+	gameManager.player->equipmentAttributes.attack = 900;
+	gameManager.player->equipmentAttributes.defend = 900;
+	gameManager.player->equipmentAttributes.evade = 900;
+	auto& stateEquipment = gameManager.goodsManager.goodsList[gameManager.goodsManager.equipIndex(4)];
+	stateEquipment.iniFile = "script_state_equipment.ini";
+	stateEquipment.number = 1;
+	stateEquipment.goods = std::make_shared<Goods>();
+	stateEquipment.goods->kind = gkEquipment;
+	stateEquipment.goods->part = "Hand";
+	stateEquipment.goods->attack = 20;
+	stateEquipment.goods->defend = 20;
+	stateEquipment.goods->evade = 20;
+	gameManager.goodsManager.refreshEquipmentEffects();
+	gameManager.player->weakMagic = std::make_shared<Magic>();
+	gameManager.player->weakMagic->weakAttackPercent = 25;
+	gameManager.player->weakMagic->weakDefendPercent = 10;
+	gameManager.player->morphMagic = std::make_shared<Magic>();
+	gameManager.player->morphMagic->attackAddPercent = 100;
+	gameManager.player->morphMagic->defendAddPercent = 100;
+	gameManager.player->morphMagic->evadeAddPercent = 100;
+	ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"getplayerstate('Attack', 'script_attack'); "
+		"getplayerstate('Defend', 'script_defend'); "
+		"getplayerstate('Evade', 'script_evade')");
+	ok = check(
+		gameManager.varList.getInteger("script_attack") == 90 &&
+		gameManager.varList.getInteger("script_defend") == 90 &&
+		gameManager.varList.getInteger("script_evade") == 80,
+		"GetPlayerState matches YYCS/XJXQY base attributes: weak applies to attack/defend and morph is excluded") && ok;
+	auto& stateMagic = gameManager.magicManager.magicList[0];
+	stateMagic.iniFile = "script_state_passive.ini";
+	stateMagic.level = 1;
+	stateMagic.magic = std::make_shared<Magic>();
+	stateMagic.magic->level[1].attack = 4;
+	stateMagic.magic->level[1].defend = 10;
+	stateMagic.magic->level[1].evade = 5;
+	gameManager.player->calInfo();
+	const auto readStateAttributes = [&]()
+	{
+		ScriptEngineRuntimeTestAccess::execute(script,
+			"getplayerstate('Attack', 'script_attack'); "
+			"getplayerstate('Defend', 'script_defend'); "
+			"getplayerstate('Evade', 'script_evade')");
+	};
+	readStateAttributes();
+	ok = check(gameManager.varList.getInteger("script_attack") == 93 &&
+		gameManager.varList.getInteger("script_defend") == 99 &&
+		gameManager.varList.getInteger("script_evade") == 85,
+		"GetPlayerState includes live equipment and learned passive attributes before weak modifiers") && ok;
+	stateEquipment.clear();
+	gameManager.goodsManager.refreshEquipmentEffects();
+	readStateAttributes();
+	ok = check(gameManager.varList.getInteger("script_attack") == 78 &&
+		gameManager.varList.getInteger("script_defend") == 81 &&
+		gameManager.varList.getInteger("script_evade") == 65,
+		"GetPlayerState follows equipment removal without retaining NPC template bonuses") && ok;
+	stateMagic = {};
+	gameManager.player->calInfo();
+	readStateAttributes();
+	ok = check(gameManager.varList.getInteger("script_attack") == 75 &&
+		gameManager.varList.getInteger("script_defend") == 72 &&
+		gameManager.varList.getInteger("script_evade") == 60,
+		"GetPlayerState follows passive removal and still excludes morph bonuses") && ok;
+	gameManager.player->attack = savedAttack;
+	gameManager.player->defend = savedDefend;
+	gameManager.player->evade = savedStateEvade;
+	gameManager.player->equipmentAttributes = savedEquipmentAttributes;
+	gameManager.goodsManager.goodsList = savedStateGoods;
+	gameManager.magicManager.magicList = savedStateMagics;
+	gameManager.player->weakMagic = savedWeakMagic;
+	gameManager.player->morphMagic = savedMorphMagic;
+	gameManager.player->calInfo();
+
+	const int savedPlayerExp = gameManager.player->exp;
+	const int savedPlayerLevelUpExp = gameManager.player->levelUpExp;
+	const int savedPlayerLevel = gameManager.player->level;
+	const std::vector<LevelInfo> savedPlayerLevelList =
+		gameManager.player->levelList;
+	const int savedThresholdTestLife = gameManager.player->life;
+	const int savedThresholdTestThew = gameManager.player->thew;
+	const int savedThresholdTestMana = gameManager.player->mana;
+	gameManager.player->exp = 35;
+	gameManager.player->levelUpExp = 0;
+	ScriptEngineRuntimeTestAccess::execute(script, "addexp(100)");
+	ok = check(gameManager.player->exp == 35,
+		"AddExp follows the configured trilogy behavior and ignores additions when no level threshold is configured") && ok;
+	LevelInfo thresholdLevel;
+	thresholdLevel.levelUpExp = 100;
+	thresholdLevel.attack = gameManager.player->attack;
+	thresholdLevel.attack2 = gameManager.player->attack2;
+	thresholdLevel.attack3 = gameManager.player->attack3;
+	thresholdLevel.defend = gameManager.player->defend;
+	thresholdLevel.defend2 = gameManager.player->defend2;
+	thresholdLevel.defend3 = gameManager.player->defend3;
+	thresholdLevel.evade = gameManager.player->evade;
+	thresholdLevel.lifeMax = gameManager.player->lifeMax;
+	thresholdLevel.thewMax = gameManager.player->thewMax;
+	thresholdLevel.manaMax = gameManager.player->manaMax;
+	LevelInfo nextThresholdLevel = thresholdLevel;
+	nextThresholdLevel.levelUpExp = 200;
+	gameManager.player->levelList = { thresholdLevel, nextThresholdLevel };
+	gameManager.player->level = 1;
+	gameManager.player->exp = 0;
+	gameManager.player->levelUpExp = 100;
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	ScriptEngineRuntimeTestAccess::execute(script, "addexp(100)");
+	ok = check(gameManager.player->level == 1
+		&& gameManager.player->exp == 100,
+		"YYCS AddExp preserves the strict-greater-than level threshold") && ok;
+	applyOriginalBehavior(gameManager.global, GAME_JXQY2);
+	gameManager.player->exp = savedPlayerExp;
+	gameManager.player->levelUpExp = savedPlayerLevelUpExp;
+	gameManager.player->level = savedPlayerLevel;
+	gameManager.player->levelList = savedPlayerLevelList;
+	gameManager.player->life = savedThresholdTestLife;
+	gameManager.player->thew = savedThresholdTestThew;
+	gameManager.player->mana = savedThresholdTestMana;
+
+	const int savedScriptLife = gameManager.player->life;
+	const int savedScriptLifeMax = gameManager.player->lifeMax;
+	const int savedScriptInvincible = gameManager.player->invincible;
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	gameManager.player->lifeMax = 2000;
+	gameManager.player->life = 1000;
+	gameManager.player->invincible = 1;
+	ScriptEngineRuntimeTestAccess::execute(script, "addlife(-600)");
+	ok = check(gameManager.player->life == 400,
+		"YYCS AddLife applies the exact script delta without damage scaling or invincibility") && ok;
+	gameManager.player->life = savedScriptLife;
+	gameManager.player->lifeMax = savedScriptLifeMax;
+	gameManager.player->invincible = savedScriptInvincible;
+	applyOriginalBehavior(gameManager.global, GAME_JXQY2);
+	gameManager.player->calInfo();
+
+	const int savedLifeMax = gameManager.player->lifeMax;
+	const int savedManaMax = gameManager.player->manaMax;
+	const int savedThewMax = gameManager.player->thewMax;
+	const int savedLife = gameManager.player->life;
+	const int savedMana = gameManager.player->mana;
+	const int savedThew = gameManager.player->thew;
+	const int savedEvade = gameManager.player->evade;
+	gameManager.player->lifeMax = 100;
+	gameManager.player->manaMax = 100;
+	gameManager.player->thewMax = 100;
+	gameManager.player->life = 40;
+	gameManager.player->mana = 35;
+	gameManager.player->thew = 30;
+	gameManager.player->evade = 5;
+	gameManager.player->calInfo();
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"addlifemax(20); addmanamax(-500); addthewmax(30); addevade(-500)");
+	ok = check(gameManager.player->lifeMax == 120
+		&& gameManager.player->manaMax == 1
+		&& gameManager.player->thewMax == 130
+		&& gameManager.player->life == 40
+		&& gameManager.player->thew == 30
+		&& gameManager.player->mana <= gameManager.player->getManaMax()
+		&& gameManager.player->evade == 0,
+		"maximum-stat additions clamp their bases without refilling current values") && ok;
+	gameManager.player->lifeMax = savedLifeMax;
+	gameManager.player->manaMax = savedManaMax;
+	gameManager.player->thewMax = savedThewMax;
+	gameManager.player->life = savedLife;
+	gameManager.player->mana = savedMana;
+	gameManager.player->thew = savedThew;
+	gameManager.player->evade = savedEvade;
+	gameManager.player->calInfo();
+
+	gameManager.player->frozen = true;
+	gameManager.player->frozenLastTime = 1000;
+	gameManager.player->frozenVisualEffect = true;
+	gameManager.player->petrified = false;
+	gameManager.player->petrifiedLastTime = 0;
+	gameManager.player->petrifiedVisualEffect = false;
+	ScriptEngineRuntimeTestAccess::execute(script, "petrifymillisecond(2500)");
+	ok = check(gameManager.player->petrified
+		&& gameManager.player->petrifiedLastTime == 2500
+		&& gameManager.player->petrifiedVisualEffect
+		&& !gameManager.player->frozen
+		&& gameManager.player->frozenLastTime == 0
+		&& !gameManager.player->frozenVisualEffect,
+		"script petrify clears an existing frozen state in the YYCS/XJXQY runtime profile") && ok;
+	gameManager.player->petrified = false;
+	gameManager.player->petrifiedLastTime = 0;
+	gameManager.player->petrifiedVisualEffect = false;
+
+	const NPCActionType savedFullLifeAction =
+		gameManager.player->actionManager->getCurrentActionType();
+	const unsigned int savedFullLifeResult = gameManager.player->result;
+	gameManager.player->life = 0;
+	gameManager.player->result |= erLifeExhaust;
+	gameManager.player->actionManager->resetActionIgnoringTransitions(acDeath);
+	ScriptEngineRuntimeTestAccess::execute(script, "fulllife()");
+	ok = check(gameManager.player->isStanding()
+		&& gameManager.player->life == gameManager.player->getLifeMax()
+		&& (gameManager.player->result & erLifeExhaust) == 0,
+		"FullLife exits the active death flow using the YYCS/XJXQY death-state reset") && ok;
+	gameManager.player->result = savedFullLifeResult;
+	gameManager.player->life = savedLife;
+	if (gameManager.player->actionManager->getCurrentActionType() !=
+		savedFullLifeAction)
+	{
+		gameManager.player->actionManager->resetActionIgnoringTransitions(
+			savedFullLifeAction);
+	}
+
+	auto recordingNPC = std::make_shared<RecordingNPC>();
+	recordingNPC->npcMagic = std::make_shared<Magic>();
+	gameManager.scriptNPC = recordingNPC;
+	const bool savedCanRun = gameManager.player->canRun;
+	const bool savedCanJump = gameManager.player->canJump;
+	const bool savedCanFight = gameManager.player->canFight;
+	const bool savedNpcAI = gameManager.global.data.NPCAI;
+	const bool savedActionCanInput = gameManager.global.data.canInput;
+	const bool savedActionFightState = gameManager.player->fightState.get();
+	gameManager.player->fightState.set(true);
+	gameManager.player->canRun = true;
+	const int disableActionsResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"disablerun(); disablejump(); disablefight(); disableinput(); disablenpcai()");
+	ok = check(disableActionsResult == LUA_OK
+		&& gameManager.player->canRun && !gameManager.player->canJump
+		&& !gameManager.player->canFight && !gameManager.global.data.canInput
+		&& !gameManager.global.data.NPCAI && !recordingNPC->isAIEnabled()
+		&& !recordingNPC->isAIDisabled && gameManager.player->fightState.get(),
+		"DisableRun is ignored while other Lua restrictions retain their independent behavior") && ok;
+	ScriptEngineRuntimeTestAccess::execute(script, "disablenpcai(''); enablenpcai()");
+	ok = check(gameManager.global.data.NPCAI && recordingNPC->isAIDisabled
+		&& !recordingNPC->isAIEnabled() && !gameManager.player->canFight
+		&& !gameManager.global.data.canInput,
+		"global EnableNpcAI preserves a separately disabled current-script NPC and other action restrictions") && ok;
+	const int enableActionsResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"enablerun(); enablejump(); enablefight(); enableinput(); enablenpcai('')");
+	ok = check(enableActionsResult == LUA_OK
+		&& gameManager.player->canRun && gameManager.player->canJump
+		&& gameManager.player->canFight && gameManager.global.data.canInput
+		&& recordingNPC->isAIEnabled() && !recordingNPC->isAIDisabled,
+		"Lua Enable commands restore their independent action permissions") && ok;
+	gameManager.player->canRun = false;
+	ScriptEngineRuntimeTestAccess::execute(script, "disablerun()");
+	ok = check(!gameManager.player->canRun,
+		"ignored DisableRun does not rewrite a separately loaded CanRun permission") && ok;
+	gameManager.player->canRun = savedCanRun;
+	gameManager.player->canJump = savedCanJump;
+	gameManager.player->canFight = savedCanFight;
+	gameManager.player->fightState.set(savedActionFightState);
+	gameManager.global.data.NPCAI = savedNpcAI;
+	gameManager.global.data.canInput = savedActionCanInput;
+
+	applyOriginalBehavior(gameManager.global, GAME_JXQY2);
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "npcgoto(29, 70)");
+	ScriptEngineRuntimeTestAccess::execute(script, "npcgotoex(31, 71)");
+	ScriptEngineRuntimeTestAccess::execute(script, "npcgotodir(6, 4)");
+	ScriptEngineRuntimeTestAccess::execute(script, "follownpc('current-leader')");
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcactiontype(9)");
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"setnpcmagicfile('missing-current-magic.ini')");
+	ok = check(recordingNPC->goToCount == 1
+		&& recordingNPC->goToExCount == 1
+		&& recordingNPC->goToDirCount == 1
+		&& recordingNPC->recordedDestination == Point{ 31, 71 }
+		&& recordingNPC->recordedDirection == 6
+		&& recordingNPC->recordedDistance == 4
+		&& recordingNPC->followNPC == "current-leader"
+		&& recordingNPC->strollIntent == 9
+		&& recordingNPC->flyIni == "missing-current-magic.ini"
+		&& !recordingNPC->inputEnabledDuringBlockingMove
+		&& gameManager.global.data.canInput,
+		"current-script NPC overloads are available consistently across game profiles") && ok;
+
+	recordingNPC->resetRecording();
+	int legacyHurtResult = ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 9)");
+	ok = check(legacyHurtResult == LUA_OK && recordingNPC->recordedAction == RecordedNpcAction::Hurt,
+		"JXQY2 script action 9 keeps legacy hurt numbering") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 10)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Sit,
+		"JXQY2 script action 10 keeps legacy sit numbering") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 12)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Special,
+		"JXQY2 script action 12 keeps the legacy special action") && ok;
+
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 9)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Sit,
+		"YYCS script action 9 follows the YYCS sit numbering") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 10)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Hurt,
+		"YYCS script action 10 follows the YYCS hurt numbering") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 13, 17, 29)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Walk
+		&& recordingNPC->recordedDestination.x == 17 && recordingNPC->recordedDestination.y == 29
+		&& recordingNPC->fightState.get(),
+		"YYCS fight-walk action maps profile numbering and forwards optional coordinates") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 14, 31, 47)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Run
+		&& recordingNPC->recordedDestination.x == 31 && recordingNPC->recordedDestination.y == 47
+		&& recordingNPC->fightState.get(),
+		"YYCS fight-run action maps profile numbering and forwards coordinates") && ok;
+	ok = check(
+		resolveScriptNpcActionFileSlot(ScriptNpcActionProfile::Yycs, 9) == 10 &&
+		resolveScriptNpcActionFileSlot(ScriptNpcActionProfile::Yycs, 10) == 9 &&
+		resolveScriptNpcActionFileSlot(ScriptNpcActionProfile::Yycs, 12) == 20 &&
+		resolveScriptNpcActionFileSlot(ScriptNpcActionProfile::Yycs, 15) == 23 &&
+		resolveScriptNpcActionFileSlot(ScriptNpcActionProfile::Legacy, 9) == 9,
+		"SetNpcActionFile translates YYCS/XJXQY action slots without changing the JXQY2 numbering") && ok;
+
+	applyOriginalBehavior(gameManager.global, GAME_XJXQY);
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', -1, '')");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Stand,
+		"XJXQY omitted legacy action maps to standing") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 13, '')");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Stand,
+		"XJXQY real action 13 call returns the character to standing") && ok;
+	recordingNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 8, 53, 71)");
+	ok = check(recordingNPC->recordedAction == RecordedNpcAction::Magic
+		&& recordingNPC->recordedDestination.x == 53 && recordingNPC->recordedDestination.y == 71,
+		"script magic action prepares the default NPC magic at the optional destination") && ok;
+
+	recordingNPC->resetRecording();
+	int unknownResult = ScriptEngineRuntimeTestAccess::execute(script, "setnpcaction('', 999, 1, 2)");
+	ok = check(unknownResult == LUA_OK && recordingNPC->recordedAction == RecordedNpcAction::None
+		&& resolveScriptNpcAction(ScriptNpcActionProfile::Xjxqy, 999) == ScriptNpcActionKind::Unknown,
+		"unknown profile action is diagnosed and does not silently select an internal enum") && ok;
+
+	recordingNPC->resetRecording();
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	const int yycsSpecialResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialaction('yycs-normal.asf')");
+	ok = check(yycsSpecialResult == LUA_OK
+		&& recordingNPC->specialActionStartCount == 1
+		&& recordingNPC->eventRunCount == 0
+		&& recordingNPC->specialActionFile == "yycs-normal.asf",
+		"YYCS ordinary NpcSpecialAction follows its non-blocking semantics") && ok;
+
+	recordingNPC->resetRecording();
+	gameManager.global.data.canInput = true;
+	const int yycsSpecialExResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialactionex('yycs-blocking.asf')");
+	ok = check(yycsSpecialExResult == LUA_OK
+		&& recordingNPC->specialActionStartCount == 1
+		&& recordingNPC->eventRunCount == 1
+		&& !recordingNPC->inputEnabledDuringEventRun
+		&& gameManager.global.data.canInput
+		&& recordingNPC->specialActionFile == "yycs-blocking.asf",
+		"YYCS NpcSpecialActionEx waits with input disabled, then restores input") && ok;
+
+	recordingNPC->resetRecording();
+	recordingNPC->specialActionStartSucceeds = false;
+	ScriptEngineRuntimeTestAccess::execute(script, "npcspecialactionex('missing-special.asf')");
+	ok = check(recordingNPC->specialActionStartCount == 1
+		&& recordingNPC->eventRunCount == 0
+		&& gameManager.global.data.canInput,
+		"NpcSpecialActionEx does not enter a nested wait when the action cannot start") && ok;
+	recordingNPC->specialActionStartSucceeds = true;
+
+	auto firstNamedNPC = std::make_shared<RecordingNPC>();
+	auto secondNamedNPC = std::make_shared<RecordingNPC>();
+	firstNamedNPC->npcName = "duplicate-special-target";
+	secondNamedNPC->npcName = "duplicate-special-target";
+	auto savedNpcList = gameManager.npcManager->npcList;
+	gameManager.npcManager->npcList.clear();
+	gameManager.npcManager->npcList.push_back(firstNamedNPC);
+	gameManager.npcManager->npcList.push_back(secondNamedNPC);
+	const int savedFirstNamedKind = firstNamedNPC->kind;
+	const Point savedPlayerKindPlayerPosition = gameManager.player->getPosition();
+	const Point savedPlayerKindNpcPosition = firstNamedNPC->getPosition();
+	const bool savedPlayerKindPlayerFight = gameManager.player->fightState.get();
+	const bool savedPlayerKindNpcFight = firstNamedNPC->fightState.get();
+	const bool savedPlayerKindCanInput = gameManager.global.data.canInput;
+	const bool savedPlayerKindCameraFollowPlayer = gameManager.camera->followPlayer;
+	auto savedPlayerKindCameraTarget = gameManager.camera->followNPC;
+	const Point savedSceneCameraPosition = gameManager.camera->position;
+	const PointEx savedSceneCameraOffset = gameManager.camera->offset;
+	const PointEx savedSceneCameraDifference = gameManager.camera->differencePosition;
+	firstNamedNPC->kind = nkPlayer;
+	gameManager.camera->differencePosition = { 3.0f, 4.0f };
+	const int mapPositionResult = ScriptEngineRuntimeTestAccess::execute(script, "setmappos(2,3)");
+	ok = check(mapPositionResult == LUA_OK && !gameManager.camera->followPlayer
+		&& gameManager.camera->differencePosition.x == 0.0f
+		&& gameManager.camera->differencePosition.y == 0.0f,
+		"SetMapPos switches to a fixed map view and clears camera motion delta") && ok;
+	const int playerSceneResult = ScriptEngineRuntimeTestAccess::execute(script, "setplayerscn()");
+	ok = check(playerSceneResult == LUA_OK && gameManager.camera->followPlayer
+		&& gameManager.camera->followNPC.lock() == firstNamedNPC
+		&& gameManager.camera->differencePosition.x == 0.0f
+		&& gameManager.camera->differencePosition.y == 0.0f,
+		"SetPlayerScn restores the player-kind follow target through the Lua wrapper") && ok;
+	firstNamedNPC->fightState.set(true);
+	gameManager.player->fightState.set(true);
+	gameManager.scriptAPI.talk("__missing_player_kind_talk_section__");
+	ok = check(!firstNamedNPC->fightState.get()
+		&& gameManager.player->fightState.get(),
+		"Talk exits the YYCS/XJXQY player-kind character from fighting state") && ok;
+	firstNamedNPC->setPosition({ 4, 5 }, false);
+	gameManager.player->setPosition({ 1, 1 }, false);
+	gameManager.scriptAPI.setPlayerPosition(20, 21);
+	ok = check(firstNamedNPC->getPosition() == Point{ 20, 21 }
+		&& gameManager.player->getPosition() == Point{ 1, 1 },
+		"two-argument SetPlayerPos targets the YYCS/XJXQY player-kind character") && ok;
+	const std::string savedPlayerKindActualPlayerName = gameManager.player->npcName;
+	gameManager.player->npcName = "actual-player-position-target";
+	gameManager.camera->followPlayer = false;
+	gameManager.scriptAPI.setPlayerPosition(
+		"actual-player-position-target", 30, 31);
+	ok = check(gameManager.player->getPosition() == Point{ 30, 31 }
+		&& firstNamedNPC->getPosition() == Point{ 20, 21 }
+		&& gameManager.camera->followPlayer
+		&& gameManager.camera->followNPC.lock() == firstNamedNPC,
+		"three-argument SetPlayerPos moves the named player and recenters on the player-kind character") && ok;
+	gameManager.player->npcName = savedPlayerKindActualPlayerName;
+	firstNamedNPC->resetRecording();
+	gameManager.global.data.canInput = true;
+	gameManager.scriptAPI.playerGoto(22, 23);
+	gameManager.scriptAPI.playerGotoEx(24, 25);
+	gameManager.scriptAPI.playerRunToEx(26, 27);
+	gameManager.scriptAPI.playerJumpTo(28, 29);
+	gameManager.scriptAPI.playerGotoDir(6, 7);
+	ok = check(firstNamedNPC->goToCount == 1
+		&& firstNamedNPC->goToExCount == 1
+		&& firstNamedNPC->goToDirCount == 1
+		&& firstNamedNPC->recordedDirection == 6
+		&& firstNamedNPC->recordedDistance == 7
+		&& !firstNamedNPC->inputEnabledDuringBlockingMove
+		&& firstNamedNPC->recordedAction == RecordedNpcAction::Jump
+		&& gameManager.global.data.canInput,
+		"Player movement APIs target the player-kind character and restore input") && ok;
+	gameManager.scriptAPI.setLevelFile("player-kind-level.ini");
+	gameManager.scriptAPI.setPlayerScn(false);
+	ok = check(firstNamedNPC->npcLevelIni == "player-kind-level.ini"
+		&& gameManager.camera->followNPC.lock() == firstNamedNPC,
+		"SetLevelFile and SetPlayerScn target the YYCS/XJXQY player-kind character") && ok;
+	firstNamedNPC->kind = savedFirstNamedKind;
+	firstNamedNPC->setPosition(savedPlayerKindNpcPosition, false);
+	firstNamedNPC->fightState.set(savedPlayerKindNpcFight);
+	gameManager.player->setPosition(savedPlayerKindPlayerPosition, false);
+	gameManager.player->fightState.set(savedPlayerKindPlayerFight);
+	gameManager.global.data.canInput = savedPlayerKindCanInput;
+	gameManager.camera->followPlayer = savedPlayerKindCameraFollowPlayer;
+	gameManager.camera->followNPC = savedPlayerKindCameraTarget;
+	gameManager.camera->position = savedSceneCameraPosition;
+	gameManager.camera->offset = savedSceneCameraOffset;
+	gameManager.camera->differencePosition = savedSceneCameraDifference;
+	firstNamedNPC->resetRecording();
+	const int savedPlayerKind = gameManager.player->kind;
+	const int savedPlayerRelation = gameManager.player->relation;
+	gameManager.player->kind = 9;
+	gameManager.player->relation = 9;
+	firstNamedNPC->kind = 9;
+	firstNamedNPC->relation = 9;
+	secondNamedNPC->kind = 9;
+	secondNamedNPC->relation = 9;
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(gameManager.varList.getInteger("NpcCount") == 1,
+		"GetNpcCount preserves the YYCS/XJXQY player-match short circuit") && ok;
+	gameManager.player->kind = 8;
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(gameManager.varList.getInteger("NpcCount") == 2,
+		"GetNpcCount counts matching NPCs when the player does not match") && ok;
+	const auto savedFirstDeathImage = firstNamedNPC->res.death.imagePackage;
+	const auto savedSecondDeathImage = secondNamedNPC->res.death.imagePackage;
+	auto deathImage = std::make_shared<IMPImage>();
+	deathImage->directions = 1;
+	deathImage->interval = 100;
+	deathImage->frame.resize(2);
+	firstNamedNPC->res.death.imagePackage = deathImage;
+	secondNamedNPC->res.death.imagePackage = deathImage;
+	firstNamedNPC->NPC::beginDie();
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(firstNamedNPC->isDying() && gameManager.varList.getInteger("NpcCount") == 1,
+		"GetNpcCount excludes a dying NPC still retained in the manager") && ok;
+	secondNamedNPC->NPC::beginDie();
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(gameManager.varList.getInteger("NpcCount") == 0,
+		"GetNpcCount reaches zero before the last death animation is removed") && ok;
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	firstNamedNPC->res.death.imagePackage = savedFirstDeathImage;
+	secondNamedNPC->res.death.imagePackage = savedSecondDeathImage;
+	const int savedFirstNamedLife = firstNamedNPC->life;
+	firstNamedNPC->life = 0;
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(gameManager.varList.getInteger("NpcCount") == 2,
+		"GetNpcCount retains active zero-life actors until they enter the death action") && ok;
+	firstNamedNPC->life = savedFirstNamedLife;
+	gameManager.player->kind = 9;
+	gameManager.player->actionManager->changeAction(acDeath);
+	gameManager.scriptAPI.getNpcCount(9, 9);
+	ok = check(gameManager.varList.getInteger("NpcCount") == 2,
+		"a dying matching player does not mask the remaining matching NPCs") && ok;
+	gameManager.player->actionManager->resetActionIgnoringTransitions(acStand);
+	gameManager.player->kind = savedPlayerKind;
+	gameManager.player->relation = savedPlayerRelation;
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	firstNamedNPC->setPosition({ 2, 2 }, false);
+	secondNamedNPC->setPosition({ 6, 2 }, false);
+	const Point playerPositionBeforeNamedSetPlayerPos =
+		gameManager.player->getPosition();
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"setplayerpos('duplicate-special-target', 9, 10); "
+		"setplayerpos(16, 6, 0)");
+	ok = check(firstNamedNPC->getPosition() == Point{ 9, 10 }
+		&& secondNamedNPC->getPosition() == Point{ 6, 2 }
+		&& gameManager.player->getPosition() ==
+			playerPositionBeforeNamedSetPlayerPos,
+		"three-argument SetPlayerPos resolves the first named character and ignores a missing target") && ok;
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	firstNamedNPC->haveAsyncDest = true;
+	secondNamedNPC->haveAsyncDest = true;
+	secondNamedNPC->npcName = "watch-second";
+	gameManager.scriptAPI.watch(
+		"duplicate-special-target",
+		"watch-second",
+		0);
+	ok = check(firstNamedNPC->recordedAction == RecordedNpcAction::None
+		&& secondNamedNPC->recordedAction == RecordedNpcAction::None
+		&& firstNamedNPC->haveAsyncDest
+		&& secondNamedNPC->haveAsyncDest,
+		"Watch changes facing without cancelling the current action or movement") && ok;
+	secondNamedNPC->npcName = "duplicate-special-target";
+
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	firstNamedNPC->scriptFile = "first-old.lua";
+	secondNamedNPC->scriptFile = "second-old.lua";
+	gameManager.scriptAPI.setNPCScript(
+		"duplicate-special-target", "first-only.lua");
+	ok = check(firstNamedNPC->scriptFile == "first-only.lua"
+		&& secondNamedNPC->scriptFile == "second-old.lua",
+		"YYCS named SetNpcScript targets only the first matching NPC") && ok;
+	gameManager.scriptAPI.setAllNPCScript(
+		"duplicate-special-target", "all.lua");
+	ok = check(firstNamedNPC->scriptFile == "all.lua"
+		&& secondNamedNPC->scriptFile == "all.lua",
+		"YYCS SetAllNpcScript preserves the explicit broadcast contract") && ok;
+	const std::string savedBatchPlayerName = gameManager.player->npcName;
+	const std::string savedBatchPlayerScript = gameManager.player->scriptFile;
+	const std::string savedBatchPlayerDeathScript = gameManager.player->deathScript;
+	const std::string savedBatchPlayerFlyIni = gameManager.player->flyIni;
+	const std::string savedBatchPlayerFlyIni2 = gameManager.player->flyIni2;
+	const std::string savedBatchPlayerFlyInis = gameManager.player->flyInis;
+	const std::string savedBatchPlayerAttackedMagic =
+		gameManager.player->magicToUseWhenBeAttackedFile;
+	const int savedBatchPlayerAttackedMagicDirection =
+		gameManager.player->magicDirectionWhenBeAttacked;
+	const Point savedBatchPlayerKeepAttack = gameManager.player->keepAttackPosition;
+	const Point savedBatchPlayerDestination = gameManager.player->destinationMapPosition;
+	gameManager.player->npcName = "duplicate-special-target";
+	gameManager.player->scriptFile = "player-script.lua";
+	gameManager.player->deathScript = "player-death.lua";
+	gameManager.player->flyIni = "player-fly.ini";
+	gameManager.player->flyIni2 = "player-fly2.ini";
+	gameManager.player->flyInis = "player-fly-list.ini:1;";
+	gameManager.player->magicToUseWhenBeAttackedFile = "player-attacked.ini";
+	gameManager.player->magicDirectionWhenBeAttacked = 7;
+	gameManager.player->keepAttackPosition = { 1, 2 };
+	gameManager.player->destinationMapPosition = { 3, 4 };
+	gameManager.scriptAPI.setAllNPCScript(
+		"duplicate-special-target", "npc-batch-script.lua");
+	gameManager.scriptAPI.setAllNPCDeathScript(
+		"duplicate-special-target", "npc-batch-death.lua");
+	gameManager.scriptAPI.changeFlyIni(
+		"duplicate-special-target", "npc-batch-fly.ini");
+	gameManager.scriptAPI.changeFlyIni2(
+		"duplicate-special-target", "npc-batch-fly2.ini");
+	gameManager.scriptAPI.addFlyInis(
+		"duplicate-special-target", "npc-batch-extra.ini", 5);
+	gameManager.scriptAPI.setNpcMagicToUseWhenBeAttacked(
+		"duplicate-special-target", "npc-batch-attacked.ini", 6);
+	gameManager.scriptAPI.setKeepAttack(
+		"duplicate-special-target", 8, 9);
+	gameManager.scriptAPI.setNpcDestination(
+		"duplicate-special-target", 10, 11);
+	const bool batchPlayerUnchanged =
+		gameManager.player->scriptFile == "player-script.lua"
+		&& gameManager.player->deathScript == "player-death.lua"
+		&& gameManager.player->flyIni == "player-fly.ini"
+		&& gameManager.player->flyIni2 == "player-fly2.ini"
+		&& gameManager.player->flyInis == "player-fly-list.ini:1;"
+		&& gameManager.player->magicToUseWhenBeAttackedFile == "player-attacked.ini"
+		&& gameManager.player->magicDirectionWhenBeAttacked == 7
+		&& gameManager.player->keepAttackPosition == Point{ 1, 2 }
+		&& gameManager.player->destinationMapPosition == Point{ 3, 4 };
+	const bool batchNpcScriptsUpdated =
+		firstNamedNPC->scriptFile == "npc-batch-script.lua"
+		&& secondNamedNPC->scriptFile == "npc-batch-script.lua"
+		&& firstNamedNPC->deathScript == "npc-batch-death.lua"
+		&& secondNamedNPC->deathScript == "npc-batch-death.lua";
+	const bool batchNpcMagicUpdated =
+		firstNamedNPC->flyIni == "npc-batch-fly.ini"
+		&& secondNamedNPC->flyIni == "npc-batch-fly.ini"
+		&& firstNamedNPC->flyIni2 == "npc-batch-fly2.ini"
+		&& secondNamedNPC->flyIni2 == "npc-batch-fly2.ini"
+		&& firstNamedNPC->flyInis.find("npc-batch-extra.ini:5;") != std::string::npos
+		&& secondNamedNPC->flyInis.find("npc-batch-extra.ini:5;") != std::string::npos
+		&& firstNamedNPC->magicToUseWhenBeAttackedFile == "npc-batch-attacked.ini"
+		&& secondNamedNPC->magicToUseWhenBeAttackedFile == "npc-batch-attacked.ini"
+		&& firstNamedNPC->magicDirectionWhenBeAttacked == 6
+		&& secondNamedNPC->magicDirectionWhenBeAttacked == 6;
+	const bool batchNpcPositionsUpdated =
+		firstNamedNPC->keepAttackPosition == Point{ 8, 9 }
+		&& secondNamedNPC->keepAttackPosition == Point{ 8, 9 }
+		&& firstNamedNPC->destinationMapPosition == Point{ 10, 11 }
+		&& secondNamedNPC->destinationMapPosition == Point{ 10, 11 };
+	ok = check(batchPlayerUnchanged,
+		"explicit NPC batch APIs leave an identically named player unchanged") && ok;
+	ok = check(batchNpcScriptsUpdated,
+		"explicit NPC script batch APIs update every matching NPC") && ok;
+	ok = check(batchNpcMagicUpdated,
+		"explicit NPC magic batch APIs update every matching NPC") && ok;
+	ok = check(batchNpcPositionsUpdated,
+		"explicit NPC movement batch APIs update every matching NPC") && ok;
+	ok = check(batchPlayerUnchanged && batchNpcScriptsUpdated
+		&& batchNpcMagicUpdated && batchNpcPositionsUpdated,
+		"explicit NPC batch APIs exclude an identically named player") && ok;
+	const int savedBatchPlayerAttack = gameManager.player->attack;
+	const int savedBatchPlayerLife = gameManager.player->life;
+	const int savedBatchPlayerLifeMax = gameManager.player->lifeMax;
+	const int savedBatchPlayerExpBonus = gameManager.player->expBonus;
+	const UTime savedBatchPlayerTimerScriptInterval =
+		gameManager.player->timerScriptInterval;
+	const int savedBatchPlayerVisionRadius = gameManager.player->visionRadius;
+	const int savedBatchPlayerLifeLowPercent = gameManager.player->lifeLowPercent;
+	firstNamedNPC->attack = 10;
+	secondNamedNPC->attack = 20;
+	gameManager.player->attack = 30;
+	firstNamedNPC->lifeMax = 100;
+	secondNamedNPC->lifeMax = 200;
+	gameManager.player->lifeMax = 300;
+	firstNamedNPC->life = 50;
+	secondNamedNPC->life = 75;
+	gameManager.player->life = 100;
+	firstNamedNPC->expBonus = 1;
+	secondNamedNPC->expBonus = 2;
+	gameManager.player->expBonus = 3;
+	firstNamedNPC->timerScriptInterval = 100;
+	secondNamedNPC->timerScriptInterval = 200;
+	gameManager.player->timerScriptInterval = 300;
+	firstNamedNPC->visionRadius = 0;
+	secondNamedNPC->visionRadius = 0;
+	gameManager.player->visionRadius = 0;
+	firstNamedNPC->lifeLowPercent = 0;
+	secondNamedNPC->lifeLowPercent = 0;
+	gameManager.player->lifeLowPercent = 0;
+	gameManager.player->calInfo();
+	const int playerEffectiveAttackBeforeAddNpcProperty =
+		gameManager.player->getAttack();
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "Attack", 4);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "LifeMax", 10);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "Life", -1000);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "ExpBonus", 5);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "TimerScriptInterval", 25);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "VisionRadius", 1);
+	gameManager.scriptAPI.addNpcProperty(
+		"duplicate-special-target", "LifeLowPercent", -5);
+	ok = check(firstNamedNPC->attack == 14
+		&& secondNamedNPC->attack == 24
+		&& gameManager.player->attack == 34
+		&& gameManager.player->getAttack() ==
+			playerEffectiveAttackBeforeAddNpcProperty + 4
+		&& firstNamedNPC->lifeMax == 110
+		&& secondNamedNPC->lifeMax == 210
+		&& gameManager.player->lifeMax == 310
+		&& firstNamedNPC->life == 0
+		&& secondNamedNPC->life == 0
+		&& gameManager.player->life == 0
+		&& firstNamedNPC->expBonus == 6
+		&& secondNamedNPC->expBonus == 7
+		&& gameManager.player->expBonus == 8
+		&& firstNamedNPC->timerScriptInterval == 125
+		&& secondNamedNPC->timerScriptInterval == 225
+		&& gameManager.player->timerScriptInterval == 325
+		&& firstNamedNPC->visionRadius == 10
+		&& secondNamedNPC->visionRadius == 10
+		&& gameManager.player->visionRadius == 10
+		&& firstNamedNPC->lifeLowPercent == -5
+		&& secondNamedNPC->lifeLowPercent == -5
+		&& gameManager.player->lifeLowPercent == -5,
+		"AddNpcProperty updates every same-name character with YYCS/XJXQY property semantics") && ok;
+	gameManager.player->attack = savedBatchPlayerAttack;
+	gameManager.player->life = savedBatchPlayerLife;
+	gameManager.player->lifeMax = savedBatchPlayerLifeMax;
+	gameManager.player->expBonus = savedBatchPlayerExpBonus;
+	gameManager.player->timerScriptInterval =
+		savedBatchPlayerTimerScriptInterval;
+	gameManager.player->visionRadius = savedBatchPlayerVisionRadius;
+	gameManager.player->lifeLowPercent = savedBatchPlayerLifeLowPercent;
+	gameManager.player->calInfo();
+	gameManager.player->npcName = savedBatchPlayerName;
+	gameManager.player->scriptFile = savedBatchPlayerScript;
+	gameManager.player->deathScript = savedBatchPlayerDeathScript;
+	gameManager.player->flyIni = savedBatchPlayerFlyIni;
+	gameManager.player->flyIni2 = savedBatchPlayerFlyIni2;
+	gameManager.player->flyInis = savedBatchPlayerFlyInis;
+	gameManager.player->magicToUseWhenBeAttackedFile = savedBatchPlayerAttackedMagic;
+	gameManager.player->magicDirectionWhenBeAttacked =
+		savedBatchPlayerAttackedMagicDirection;
+	gameManager.player->keepAttackPosition = savedBatchPlayerKeepAttack;
+	gameManager.player->destinationMapPosition = savedBatchPlayerDestination;
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acWalk);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acWalk);
+	firstNamedNPC->nowAction = acWalk;
+	secondNamedNPC->nowAction = acWalk;
+	firstNamedNPC->direction = 1;
+	secondNamedNPC->direction = 2;
+	gameManager.scriptAPI.setNPCDir("duplicate-special-target", 6);
+	ok = check(firstNamedNPC->direction == 6
+		&& secondNamedNPC->direction == 2,
+		"YYCS named SetNpcDir updates the first matching NPC even during an active action") && ok;
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	firstNamedNPC->nowAction = acStand;
+	secondNamedNPC->nowAction = acStand;
+	firstNamedNPC->goToCount = 0;
+	secondNamedNPC->goToCount = 0;
+	gameManager.scriptAPI.goTo("duplicate-special-target", 15, 104);
+	ok = check(firstNamedNPC->goToCount == 1
+		&& firstNamedNPC->recordedDestination == Point{ 15, 104 }
+		&& secondNamedNPC->goToCount == 0,
+		"YYCS named NpcGoto waits for only the first matching NPC") && ok;
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	const bool inputBeforeLegacyRun = gameManager.global.data.canInput;
+	const int runResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"npcrunto('duplicate-special-target',30,27)");
+	ok = check(runResult == LUA_OK && firstNamedNPC->runToCount == 1
+		&& firstNamedNPC->recordedAction == RecordedNpcAction::Run
+		&& firstNamedNPC->recordedDestination == Point{ 30, 27 }
+		&& firstNamedNPC->goToCount == 0 && firstNamedNPC->goToExCount == 0
+		&& secondNamedNPC->runToCount == 0 && !firstNamedNPC->inputEnabledDuringBlockingMove
+		&& gameManager.global.data.canInput == inputBeforeLegacyRun,
+		"legacy NpcRunTo delegates to blocking run for the first named NPC and restores input") && ok;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"npcrunto(); npcrunto('duplicate-special-target',1); npcrunto('missing-run-target',1,2)");
+	ok = check(firstNamedNPC->runToCount == 1 && secondNamedNPC->runToCount == 0,
+		"legacy NpcRunTo requires the verified named three-argument form") && ok;
+	const int changeResult = ScriptEngineRuntimeTestAccess::execute(script,
+		"changenpcres('duplicate-special-target','legacy-changed-res.ini')");
+	ok = check(changeResult == LUA_OK && firstNamedNPC->npcIni == "legacy-changed-res.ini"
+		&& firstNamedNPC->initResCount == 1 && secondNamedNPC->initResCount == 0,
+		"legacy ChangeNpcRes loads the replacement resource for the first named NPC") && ok;
+	ScriptEngineRuntimeTestAccess::execute(script,
+		"changenpcres('duplicate-special-target',''); changenpcres(''); changenpcres('','unused.ini')");
+	ok = check(firstNamedNPC->npcIni == "legacy-changed-res.ini" && firstNamedNPC->initResCount == 1,
+		"legacy ChangeNpcRes ignores empty resources and unverified implicit-target forms") && ok;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	firstNamedNPC->npcIni = "first-old.ini";
+	secondNamedNPC->npcIni = "second-old.ini";
+	firstNamedNPC->level = 1;
+	secondNamedNPC->level = 2;
+	firstNamedNPC->strollIntent = 3;
+	secondNamedNPC->strollIntent = 4;
+	firstNamedNPC->dropIni = "first-old-drop.ini";
+	secondNamedNPC->dropIni = "second-old-drop.ini";
+	firstNamedNPC->flyIni = "first-old-magic.ini";
+	secondNamedNPC->flyIni = "second-old-magic.ini";
+	gameManager.scriptAPI.setNPCRes(
+		"duplicate-special-target", "first-only-res.ini");
+	gameManager.scriptAPI.setNPCLevel("duplicate-special-target", 12);
+	gameManager.scriptAPI.setNPCActionType("duplicate-special-target", 8);
+	gameManager.scriptAPI.setNPCActionFile(
+		"duplicate-special-target", 3, "first-only-action.asf");
+	gameManager.scriptAPI.setDropIni(
+		"duplicate-special-target", "first-only-drop.ini");
+	gameManager.scriptAPI.setNpcMagicFile(
+		"duplicate-special-target", "first-only-magic.ini");
+	ok = check(firstNamedNPC->npcIni == "first-only-res.ini"
+		&& firstNamedNPC->initResCount == 1
+		&& firstNamedNPC->level == 12
+		&& firstNamedNPC->setLevelCount == 1
+		&& firstNamedNPC->strollIntent == 8
+		&& firstNamedNPC->loadedActionFile == "first-only-action.asf"
+		&& firstNamedNPC->loadedAction == 3
+		&& firstNamedNPC->dropIni == "first-only-drop.ini"
+		&& firstNamedNPC->flyIni == "first-only-magic.ini"
+		&& secondNamedNPC->npcIni == "second-old.ini"
+		&& secondNamedNPC->initResCount == 0
+		&& secondNamedNPC->level == 2
+		&& secondNamedNPC->setLevelCount == 0
+		&& secondNamedNPC->strollIntent == 4
+		&& secondNamedNPC->loadActionFileCount == 0
+		&& secondNamedNPC->dropIni == "second-old-drop.ini"
+		&& secondNamedNPC->flyIni == "second-old-magic.ini",
+		"YYCS named NPC resource and property mutators target only the first match") && ok;
+
+	firstNamedNPC->relation = nrFriendly;
+	secondNamedNPC->relation = nrFriendly;
+	firstNamedNPC->fightState.set(true);
+	secondNamedNPC->fightState.set(true);
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acRun);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acRun);
+	gameManager.scriptAPI.setNPCRelation(
+		"duplicate-special-target", nrHostile);
+	ok = check(
+		firstNamedNPC->relation == nrHostile &&
+		secondNamedNPC->relation == nrHostile &&
+		!firstNamedNPC->fightState.get() &&
+		!secondNamedNPC->fightState.get() &&
+		firstNamedNPC->actionManager->getCurrentActionType() == acRun &&
+		secondNamedNPC->actionManager->getCurrentActionType() == acRun,
+		"YYCS SetNpcRelation keeps the explicit all-match contract without cancelling the current action") && ok;
+
+
+	{
+		const auto previousProfile = gameManager.global.npcRuntimeProfile;
+		const auto previousScriptNpc = gameManager.scriptNPC;
+		const std::size_t previousNpcCount = gameManager.npcManager->npcList.size();
+		auto currentPhase = std::make_shared<RecordingNPC>();
+		auto nextPhase = std::make_shared<RecordingNPC>();
+		currentPhase->npcName = nextPhase->npcName = "staged-named-character";
+		currentPhase->kind = nextPhase->kind = nkBattle;
+		currentPhase->relation = nextPhase->relation = nrFriendly;
+		currentPhase->scriptHidden = nextPhase->scriptHidden = true;
+		nextPhase->visibleVariableName = "$named_character_stage";
+		nextPhase->visibleVariableValue = 1;
+		gameManager.varList.setInteger("$named_character_stage", 0);
+		nextPhase->updateVisibleByVariable();
+		gameManager.npcManager->npcList.push_back(currentPhase);
+		gameManager.npcManager->npcList.push_back(nextPhase);
+		gameManager.global.npcRuntimeProfile = ScriptNpcRuntimeProfile::Trilogy;
+		ScriptEngineRuntimeTestAccess::execute(script,
+			"setnpcrelation('staged-named-character',1); setnpckind('staged-named-character',0)");
+		ok = check(currentPhase->relation == nrHostile && currentPhase->kind == nkNormal
+			&& !nextPhase->isVisibleByVariable && nextPhase->relation == nrFriendly
+			&& nextPhase->kind == nkBattle,
+			"YYCS kind and relation changes exclude an inactive namesake, while script-hidden active NPCs remain eligible") && ok;
+
+		gameManager.varList.setInteger("$named_character_stage", 1);
+		nextPhase->updateVisibleByVariable();
+		ScriptEngineRuntimeTestAccess::execute(script,
+			"setnpcrelation('staged-named-character',1); setnpckind('staged-named-character',0)");
+		ok = check(nextPhase->isVisibleByVariable && nextPhase->relation == nrHostile
+			&& nextPhase->kind == nkNormal,
+			"an activated next phase becomes eligible for later named script changes") && ok;
+
+		gameManager.varList.setInteger("$named_character_stage", 0);
+		nextPhase->updateVisibleByVariable();
+		gameManager.global.npcRuntimeProfile = ScriptNpcRuntimeProfile::Legacy;
+		ScriptEngineRuntimeTestAccess::execute(script,
+			"setnpcrelation('staged-named-character',2); setnpckind('staged-named-character',1)");
+		ok = check(nextPhase->relation == nrNeutral && nextPhase->kind == nkBattle,
+			"legacy named changes retain their existing inactive-NPC behavior") && ok;
+
+		gameManager.global.npcRuntimeProfile = ScriptNpcRuntimeProfile::Trilogy;
+		gameManager.scriptNPC = nextPhase;
+		ScriptEngineRuntimeTestAccess::execute(script, "setnpcrelation('',0); setnpckind('',0)");
+		ok = check(!nextPhase->isVisibleByVariable && nextPhase->relation == nrFriendly
+			&& nextPhase->kind == nkNormal,
+			"an explicit empty-name script owner remains eligible even while inactive") && ok;
+		const auto playerNameBefore = gameManager.player->npcName;
+		const int playerRelationBefore = gameManager.player->relation;
+		const bool playerVariableVisibilityBefore = gameManager.player->isVisibleByVariable;
+		gameManager.player->npcName = "staged-named-character";
+		gameManager.player->isVisibleByVariable = false;
+		ScriptEngineRuntimeTestAccess::execute(script, "setnpcrelation('staged-named-character',2)");
+		ok = check(gameManager.player->relation == nrNeutral,
+			"the named player remains eligible independently of NPC variable visibility") && ok;
+		gameManager.player->npcName = playerNameBefore;
+		gameManager.player->relation = playerRelationBefore;
+		gameManager.player->isVisibleByVariable = playerVariableVisibilityBefore;
+		gameManager.scriptNPC = previousScriptNpc;
+		gameManager.global.npcRuntimeProfile = previousProfile;
+		gameManager.npcManager->npcList.resize(previousNpcCount);
+	}
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	gameManager.scriptAPI.setNPCPosition(
+		"duplicate-special-target", 0, 0);
+	gameManager.scriptAPI.setNPCAction(
+		"duplicate-special-target", 0, 0, 0);
+	gameManager.scriptAPI.attackTo(
+		"duplicate-special-target", 7, 9);
+	ok = check(firstNamedNPC->recordedAction == RecordedNpcAction::Attack
+		&& firstNamedNPC->recordedDestination == Point{ 7, 9 }
+		&& firstNamedNPC->eventRunCount == 0
+		&& secondNamedNPC->recordedAction == RecordedNpcAction::None,
+		"YYCS named NPC position, action, and non-blocking attack target only the first match") && ok;
+
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialaction('duplicate-special-target', 'yycs-first.asf')");
+	ok = check(firstNamedNPC->specialActionStartCount == 1
+		&& firstNamedNPC->eventRunCount == 0
+		&& secondNamedNPC->specialActionStartCount == 0,
+		"YYCS named NpcSpecialAction targets only the first matching NPC") && ok;
+	const std::string savedPlayerName = gameManager.player->npcName;
+	const NPCActionRes savedPlayerSpecialAction = gameManager.player->res.special;
+	const NPCActionRes savedPlayerSpecialOverlayResource = gameManager.player->scriptSpecialActionOverlayResource;
+	const NPCActionType savedPlayerAction = gameManager.player->actionManager->getCurrentActionType();
+	const int savedPlayerDirection = gameManager.player->direction;
+	const bool savedPlayerSpecialOverlayActive = gameManager.player->scriptSpecialActionOverlayActive;
+	const UTime savedPlayerSpecialOverlayElapsed = gameManager.player->scriptSpecialActionOverlayElapsed;
+	const UTime savedPlayerSpecialOverlayDuration = gameManager.player->scriptSpecialActionOverlayDuration;
+	const int savedPlayerSpecialOverlayDirection = gameManager.player->scriptSpecialActionOverlayDirection;
+	auto playerSpecialImage = std::make_shared<IMPImage>();
+	playerSpecialImage->directions = 1;
+	playerSpecialImage->interval = 1;
+	playerSpecialImage->frame.resize(1);
+	gameManager.npcManager->actionImageList["player-first.asf"] = playerSpecialImage;
+	gameManager.npcManager->actionImageList["player-ex.asf"] = playerSpecialImage;
+	gameManager.player->npcName = "duplicate-special-target";
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	const int playerFirstSpecialResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialaction('duplicate-special-target', 'player-first.asf')");
+	ok = check(playerFirstSpecialResult == LUA_OK
+		&& gameManager.player->scriptSpecialActionOverlayResource.imageFile == "player-first.asf"
+		&& gameManager.player->scriptSpecialActionOverlayActive
+		&& firstNamedNPC->specialActionStartCount == 0
+		&& secondNamedNPC->specialActionStartCount == 0,
+		"YYCS/XJXQY named special actions prefer the player over same-name NPCs") && ok;
+	const int playerSpecialExResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialactionex('duplicate-special-target', 'player-ex.asf')");
+	ok = check(playerSpecialExResult == LUA_OK
+		&& gameManager.player->scriptSpecialActionOverlayResource.imageFile == "player-ex.asf"
+		&& !gameManager.player->scriptSpecialActionOverlayActive
+		&& firstNamedNPC->specialActionStartCount == 0
+		&& secondNamedNPC->specialActionStartCount == 0,
+		"YYCS/XJXQY player NpcSpecialActionEx advances and completes its overlay") && ok;
+	gameManager.npcManager->actionImageList.erase("player-first.asf");
+	gameManager.npcManager->actionImageList.erase("player-ex.asf");
+	gameManager.player->npcName = savedPlayerName;
+	gameManager.player->res.special = savedPlayerSpecialAction;
+	gameManager.player->scriptSpecialActionOverlayResource = savedPlayerSpecialOverlayResource;
+	gameManager.player->scriptSpecialActionOverlayActive = savedPlayerSpecialOverlayActive;
+	gameManager.player->scriptSpecialActionOverlayElapsed = savedPlayerSpecialOverlayElapsed;
+	gameManager.player->scriptSpecialActionOverlayDuration = savedPlayerSpecialOverlayDuration;
+	gameManager.player->scriptSpecialActionOverlayDirection = savedPlayerSpecialOverlayDirection;
+	if (gameManager.player->actionManager->getCurrentActionType() != savedPlayerAction)
+	{
+		gameManager.player->actionManager->resetActionIgnoringTransitions(savedPlayerAction);
+	}
+	gameManager.player->direction = savedPlayerDirection;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	applyOriginalBehavior(gameManager.global, GAME_XJXQY);
+	const int xjxqySpecialResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialaction('duplicate-special-target', 'xjxqy-normal.asf')");
+	ok = check(xjxqySpecialResult == LUA_OK
+		&& firstNamedNPC->specialActionStartCount == 1
+		&& firstNamedNPC->eventRunCount == 0
+		&& secondNamedNPC->specialActionStartCount == 0,
+		"XJXQY ordinary NpcSpecialAction uses the first-target non-blocking contract") && ok;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	gameManager.global.data.canInput = true;
+	const int xjxqySpecialExResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialactionex('duplicate-special-target', 'xjxqy-first.asf')");
+	ok = check(xjxqySpecialExResult == LUA_OK
+		&& firstNamedNPC->specialActionStartCount == 1
+		&& firstNamedNPC->eventRunCount == 1
+		&& !firstNamedNPC->inputEnabledDuringEventRun
+		&& gameManager.global.data.canInput
+		&& secondNamedNPC->specialActionStartCount == 0,
+		"XJXQY NpcSpecialActionEx uses the first-target and input contract") && ok;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	applyOriginalBehavior(gameManager.global, GAME_JXQY2);
+	firstNamedNPC->scriptFile = "first-old.lua";
+	secondNamedNPC->scriptFile = "second-old.lua";
+	gameManager.scriptAPI.setNPCScript(
+		"duplicate-special-target", "jxqy2-first.lua");
+	ok = check(firstNamedNPC->scriptFile == "jxqy2-first.lua"
+		&& secondNamedNPC->scriptFile == "second-old.lua",
+		"JXQY2 named SetNpcScript uses the shared first-target contract") && ok;
+	gameManager.scriptAPI.setAllNPCScript(
+		"duplicate-special-target", "jxqy2-all.lua");
+	ok = check(firstNamedNPC->scriptFile == "jxqy2-all.lua"
+		&& secondNamedNPC->scriptFile == "jxqy2-all.lua",
+		"JXQY2 SetAllNpcScript keeps the explicit broadcast contract") && ok;
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acWalk);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acWalk);
+	firstNamedNPC->nowAction = acWalk;
+	secondNamedNPC->nowAction = acWalk;
+	firstNamedNPC->direction = 1;
+	secondNamedNPC->direction = 2;
+	gameManager.scriptAPI.setNPCDir("duplicate-special-target", 7);
+	ok = check(firstNamedNPC->direction == 1
+		&& secondNamedNPC->direction == 2,
+		"JXQY2 SetNpcDir preserves main behavior by ignoring moving NPCs") && ok;
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	firstNamedNPC->nowAction = acStand;
+	secondNamedNPC->nowAction = acStand;
+	gameManager.scriptAPI.setNPCDir("duplicate-special-target", 7);
+	ok = check(firstNamedNPC->direction == 7
+		&& secondNamedNPC->direction == 2,
+		"JXQY2 named SetNpcDir uses the shared first-target contract") && ok;
+	firstNamedNPC->goToCount = 0;
+	secondNamedNPC->goToCount = 0;
+	gameManager.scriptAPI.goTo("duplicate-special-target", 15, 104);
+	ok = check(firstNamedNPC->goToCount == 1
+		&& secondNamedNPC->goToCount == 0,
+		"JXQY2 named NpcGoto uses the shared first-target contract") && ok;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	firstNamedNPC->npcIni = "first-old.ini";
+	secondNamedNPC->npcIni = "second-old.ini";
+	firstNamedNPC->level = 1;
+	secondNamedNPC->level = 2;
+	firstNamedNPC->strollIntent = 3;
+	secondNamedNPC->strollIntent = 4;
+	firstNamedNPC->dropIni = "first-old-drop.ini";
+	secondNamedNPC->dropIni = "second-old-drop.ini";
+	firstNamedNPC->flyIni = "first-old-magic.ini";
+	secondNamedNPC->flyIni = "second-old-magic.ini";
+	gameManager.scriptAPI.setNPCRes(
+		"duplicate-special-target", "jxqy2-first-res.ini");
+	gameManager.scriptAPI.setNPCLevel("duplicate-special-target", 20);
+	gameManager.scriptAPI.setNPCActionType("duplicate-special-target", 6);
+	gameManager.scriptAPI.setNPCActionFile(
+		"duplicate-special-target", 4, "jxqy2-first-action.asf");
+	gameManager.scriptAPI.setDropIni(
+		"duplicate-special-target", "jxqy2-first-drop.ini");
+	gameManager.scriptAPI.setNpcMagicFile(
+		"duplicate-special-target", "jxqy2-first-magic.ini");
+	gameManager.scriptAPI.setNPCPosition(
+		"duplicate-special-target", 0, 0);
+	gameManager.scriptAPI.setNPCAction(
+		"duplicate-special-target", 0, 0, 0);
+	gameManager.scriptAPI.attackTo(
+		"duplicate-special-target", 11, 13);
+	ok = check(firstNamedNPC->npcIni == "jxqy2-first-res.ini"
+		&& firstNamedNPC->initResCount == 1
+		&& secondNamedNPC->npcIni == "second-old.ini"
+		&& secondNamedNPC->initResCount == 0
+		&& firstNamedNPC->level == 20
+		&& firstNamedNPC->setLevelCount == 1
+		&& secondNamedNPC->level == 2
+		&& secondNamedNPC->setLevelCount == 0
+		&& firstNamedNPC->strollIntent == 6
+		&& secondNamedNPC->strollIntent == 4
+		&& firstNamedNPC->loadedActionFile == "jxqy2-first-action.asf"
+		&& secondNamedNPC->loadActionFileCount == 0
+		&& firstNamedNPC->dropIni == "jxqy2-first-drop.ini"
+		&& secondNamedNPC->dropIni == "second-old-drop.ini"
+		&& firstNamedNPC->flyIni == "jxqy2-first-magic.ini"
+		&& secondNamedNPC->flyIni == "second-old-magic.ini"
+		&& firstNamedNPC->recordedAction == RecordedNpcAction::Attack
+		&& secondNamedNPC->recordedAction == RecordedNpcAction::None
+		&& firstNamedNPC->recordedDestination == Point{ 11, 13 }
+		&& firstNamedNPC->eventRunCount == 0
+		&& secondNamedNPC->eventRunCount == 0,
+		"JXQY2 named NPC mutators use the shared first-target contract") && ok;
+
+	firstNamedNPC->state = 1;
+	secondNamedNPC->state = 2;
+	firstNamedNPC->isAIDisabled = false;
+	secondNamedNPC->isAIDisabled = false;
+	firstNamedNPC->magicLevel = 1;
+	secondNamedNPC->magicLevel = 2;
+	firstNamedNPC->attackLevel = 1;
+	secondNamedNPC->attackLevel = 2;
+	firstNamedNPC->scriptFile = "first-old-click.lua";
+	secondNamedNPC->scriptFile = "second-old-click.lua";
+	firstNamedNPC->kind = nkNormal;
+	secondNamedNPC->kind = nkNormal;
+	firstNamedNPC->relation = nrNeutral;
+	secondNamedNPC->relation = nrNeutral;
+	firstNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	secondNamedNPC->actionManager->resetActionIgnoringTransitions(acStand);
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "setnpcstate('duplicate-special-target', 9)");
+	gameManager.scriptAPI.setNpcAIEnabled("duplicate-special-target", false);
+	gameManager.scriptAPI.showNpc("duplicate-special-target", 0);
+	gameManager.scriptAPI.setNpcMagicLevel("duplicate-special-target", 7);
+	gameManager.scriptAPI.setNpcClickScript(
+		"duplicate-special-target", "first-click.lua");
+	gameManager.scriptAPI.setNpcPartner("duplicate-special-target");
+	ok = check(firstNamedNPC->state == 9
+		&& secondNamedNPC->state == 2
+		&& firstNamedNPC->isAIDisabled
+		&& !secondNamedNPC->isAIDisabled
+		&& !firstNamedNPC->scriptHidden
+		&& firstNamedNPC->isVisibleForRuntime()
+		&& secondNamedNPC->scriptHidden
+		&& !secondNamedNPC->isVisibleForRuntime()
+		&& firstNamedNPC->actionManager->getCurrentActionType() == acStand
+		&& secondNamedNPC->actionManager->getCurrentActionType() == acStand
+		&& firstNamedNPC->magicLevel == 7
+		&& firstNamedNPC->attackLevel == 7
+		&& secondNamedNPC->magicLevel == 2
+		&& secondNamedNPC->attackLevel == 2
+		&& firstNamedNPC->scriptFile == "first-click.lua"
+		&& secondNamedNPC->scriptFile == "second-old-click.lua"
+		&& firstNamedNPC->kind == nkPartner
+		&& firstNamedNPC->relation == nrFriendly
+		&& secondNamedNPC->kind == nkNormal
+		&& secondNamedNPC->relation == nrNeutral,
+		"JXQY2 singular named NPC extensions keep their command-specific target contract") && ok;
+	const auto savedClickProfile = gameManager.global.npcActionProfile;
+	gameManager.global.npcActionProfile = ScriptNpcActionProfile::Xjxqy;
+	const auto clickTaskCount = gameManager.scriptTaskList.size();
+	gameManager.scriptAPI.setNpcClickScript("duplicate-special-target", "xjxqy-movement-click.lua");
+	ok = check(firstNamedNPC->scriptFile == "first-click.lua"
+		&& secondNamedNPC->scriptFile == "second-old-click.lua"
+		&& gameManager.scriptTaskList.size() == clickTaskCount + 1
+		&& gameManager.scriptTaskList.back().scriptName == "xjxqy-movement-click.lua"
+		&& gameManager.scriptTaskList.back().type == stScript,
+		"XJXQY queues its click movement script while preserving both NPC dialogue bindings") && ok;
+	gameManager.scriptTaskList.pop_back();
+	gameManager.global.npcActionProfile = savedClickProfile;
+	gameManager.scriptAPI.showNpc("duplicate-special-target", 1);
+	ok = check(!secondNamedNPC->scriptHidden
+		&& secondNamedNPC->isVisibleForRuntime()
+		&& secondNamedNPC->actionManager->getCurrentActionType() == acStand,
+		"ShowNpc restores the last matching NPC without replacing its current action") && ok;
+
+	auto duplicatePlayerNameNPC = std::make_shared<RecordingNPC>();
+	duplicatePlayerNameNPC->npcName = gameManager.player->npcName;
+	gameManager.npcManager->npcList.push_back(duplicatePlayerNameNPC);
+	gameManager.scriptAPI.showNpc(gameManager.player->npcName, 0);
+	ok = check(gameManager.player->scriptHidden
+		&& !duplicatePlayerNameNPC->scriptHidden,
+		"ShowNpc gives the player priority over same-name map NPCs") && ok;
+	gameManager.scriptAPI.showNpc(gameManager.player->npcName, 1);
+	ok = check(!gameManager.player->scriptHidden,
+		"ShowNpc restores player visibility through the player-priority path") && ok;
+	gameManager.npcManager->npcList.pop_back();
+
+	firstNamedNPC->lifeMax = 100;
+	secondNamedNPC->lifeMax = 200;
+	firstNamedNPC->life = 100;
+	secondNamedNPC->life = 200;
+	firstNamedNPC->manaMax = 120;
+	secondNamedNPC->manaMax = 220;
+	firstNamedNPC->mana = 120;
+	secondNamedNPC->mana = 220;
+	firstNamedNPC->thewMax = 140;
+	secondNamedNPC->thewMax = 240;
+	firstNamedNPC->thew = 140;
+	secondNamedNPC->thew = 240;
+	firstNamedNPC->kindValue = 10;
+	secondNamedNPC->kindValue = 20;
+	firstNamedNPC->kindValueMax = 100;
+	secondNamedNPC->kindValueMax = 100;
+	firstNamedNPC->talkContent = "first-old-talk";
+	secondNamedNPC->talkContent = "second-old-talk";
+	firstNamedNPC->flyInis.clear();
+	secondNamedNPC->flyInis.clear();
+	firstNamedNPC->isSignalShow = false;
+	secondNamedNPC->isSignalShow = true;
+	firstNamedNPC->signalIndex = 0;
+	secondNamedNPC->signalIndex = 5;
+	firstNamedNPC->signalType = "first-old-signal";
+	secondNamedNPC->signalType = "second-old-signal";
+	gameManager.scriptAPI.changeLife("duplicate-special-target", 25);
+	gameManager.scriptAPI.changeMana("duplicate-special-target", 50);
+	gameManager.scriptAPI.changeThew("duplicate-special-target", 75);
+	gameManager.scriptAPI.addKindValue("duplicate-special-target", 7);
+	gameManager.scriptAPI.setNpcTalkContent(
+		"duplicate-special-target", "first-talk");
+	gameManager.scriptAPI.addNpcMagic(
+		"duplicate-special-target", "first-extra-magic.ini");
+	gameManager.scriptAPI.showSignalTip(
+		"duplicate-special-target", 3, "quest");
+	gameManager.scriptAPI.setSignalTipHidden("duplicate-special-target");
+	ok = check(firstNamedNPC->life == 25
+		&& secondNamedNPC->life == 200
+		&& firstNamedNPC->mana == 60
+		&& secondNamedNPC->mana == 220
+		&& firstNamedNPC->thew == 105
+		&& secondNamedNPC->thew == 240
+		&& firstNamedNPC->kindValue == 17
+		&& secondNamedNPC->kindValue == 20
+		&& firstNamedNPC->talkContent == "first-talk"
+		&& secondNamedNPC->talkContent == "second-old-talk"
+		&& firstNamedNPC->flyInis == "first-extra-magic.ini:0;"
+		&& secondNamedNPC->flyInis.empty()
+		&& !firstNamedNPC->isSignalShow
+		&& secondNamedNPC->isSignalShow
+		&& firstNamedNPC->signalIndex == 3
+		&& secondNamedNPC->signalIndex == 5
+		&& firstNamedNPC->signalType == "quest"
+		&& secondNamedNPC->signalType == "second-old-signal",
+		"JXQY2 named extension mutators share the first-target contract") && ok;
+
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialaction('duplicate-special-target', 'jxqy2-blocking.asf')");
+	ok = check(firstNamedNPC->specialActionStartCount == 1
+		&& firstNamedNPC->eventRunCount == 1
+		&& secondNamedNPC->specialActionStartCount == 0
+		&& secondNamedNPC->eventRunCount == 0,
+		"JXQY2 ordinary NpcSpecialAction keeps blocking but uses the shared first target") && ok;
+
+	firstNamedNPC->resetRecording();
+	secondNamedNPC->resetRecording();
+	ScriptEngineRuntimeTestAccess::execute(
+		script, "npcspecialactionnonblocking('duplicate-special-target', 'jxqy2-non-blocking.asf')");
+	ok = check(firstNamedNPC->specialActionStartCount == 1
+		&& firstNamedNPC->eventRunCount == 0
+		&& secondNamedNPC->specialActionStartCount == 0
+		&& secondNamedNPC->eventRunCount == 0,
+		"JXQY2 explicit NpcSpecialActionNonBlocking uses the shared first target") && ok;
+	firstNamedNPC->kind = nkNormal;
+	secondNamedNPC->kind = nkNormal;
+	auto sameNamePartner = std::make_shared<RecordingNPC>();
+	sameNamePartner->npcName = "duplicate-special-target";
+	sameNamePartner->kind = nkPartner;
+	gameManager.npcManager->npcList.push_back(sameNamePartner);
+	gameManager.scriptAPI.deleteNPC("duplicate-special-target");
+	ok = check(gameManager.npcManager->npcList == std::vector<std::shared_ptr<NPC>>{sameNamePartner},
+		"DelNpc removes matching ordinary NPCs and preserves a same-name partner") && ok;
+	gameManager.npcManager->npcList = std::move(savedNpcList);
+
+	auto forcedSpecialNPC = std::make_shared<InMemorySpecialActionNPC>();
+	forcedSpecialNPC->actionManager->resetActionIgnoringTransitions(acHide);
+	forcedSpecialNPC->immobilized = true;
+	forcedSpecialNPC->petrified = true;
+	forcedSpecialNPC->petrifiedLastTime = 100;
+	const bool forcedSpecialStarted = forcedSpecialNPC->startScriptSpecialAction("forced-special.asf");
+	ok = check(forcedSpecialStarted
+		&& forcedSpecialNPC->actionManager->getCurrentActionType() == acSpecial,
+		"script special actions bypass ordinary transition, immobilize, and petrify gates") && ok;
+	forcedSpecialNPC->setOffset({ 7.0f, 9.0f });
+	forcedSpecialNPC->stepList.push_back({ 2, 3 });
+	forcedSpecialNPC->actionBeginTime = std::numeric_limits<UTime>::max();
+	const bool restartedSpecial = forcedSpecialNPC->startScriptSpecialAction("restarted-special.asf");
+	ok = check(restartedSpecial
+		&& forcedSpecialNPC->loadedFileName == "restarted-special.asf"
+		&& forcedSpecialNPC->getOffset().x == 0.0f
+		&& forcedSpecialNPC->getOffset().y == 0.0f
+		&& forcedSpecialNPC->stepList.empty()
+		&& forcedSpecialNPC->actionBeginTime != std::numeric_limits<UTime>::max(),
+		"a second scripted special action restarts the active one-shot animation") && ok;
+	forcedSpecialNPC->advanceFrameForTest(forcedSpecialNPC->actionLastTime);
+	ok = check(forcedSpecialNPC->actionManager->getCurrentActionType() == acSpecial
+		&& forcedSpecialNPC->petrified,
+		"JXQY2 petrify pauses a scripted special action like main") && ok;
+	forcedSpecialNPC->clearPetrifiedState();
+	forcedSpecialNPC->advanceFrameForTest(forcedSpecialNPC->actionLastTime);
+	ok = check(forcedSpecialNPC->actionManager->getCurrentActionType() == acStand,
+		"JXQY2 scripted special actions resume and return to stand after petrify clears") && ok;
+
+	for (int yycsOrXjxqyGameType : { GAME_YYCS, GAME_XJXQY })
+	{
+		applyOriginalBehavior(
+			gameManager.global, yycsOrXjxqyGameType);
+		auto overlaySpecialNPC = std::make_shared<InMemorySpecialActionNPC>();
+		overlaySpecialNPC->res.special.imageFile = "persistent-special.asf";
+		overlaySpecialNPC->actionManager->resetActionIgnoringTransitions(acHide);
+		overlaySpecialNPC->immobilized = true;
+		overlaySpecialNPC->petrified = true;
+		overlaySpecialNPC->direction = 2;
+		overlaySpecialNPC->setOffset({ 7.0f, 9.0f });
+		overlaySpecialNPC->stepList.push_back({ 2, 3 });
+		const bool firstOverlayStarted = overlaySpecialNPC->startScriptSpecialAction("first-overlay.asf");
+		const UTime firstOverlayDuration = overlaySpecialNPC->scriptSpecialActionOverlayDuration;
+		overlaySpecialNPC->direction = 6;
+		const bool secondOverlayStarted = overlaySpecialNPC->startScriptSpecialAction("second-overlay.asf");
+		overlaySpecialNPC->provideResource = false;
+		const bool missingOverlayRestarted = overlaySpecialNPC->startScriptSpecialAction("missing-overlay.asf");
+		overlaySpecialNPC->provideResource = true;
+		const bool failedRestartPreservedOverlay = !missingOverlayRestarted
+			&& overlaySpecialNPC->scriptSpecialActionOverlayResource.imageFile == "second-overlay.asf"
+			&& overlaySpecialNPC->scriptSpecialActionOverlayActive;
+		overlaySpecialNPC->direction = 7;
+		const UTime actionBeginTimeBeforeHiddenOverlay = overlaySpecialNPC->actionBeginTime;
+		overlaySpecialNPC->visibleVariableName = "$hidden-special-overlay";
+		overlaySpecialNPC->visibleVariableValue = 1;
+		overlaySpecialNPC->advanceFrameForTest(25);
+		const bool hiddenOverlayPaused = overlaySpecialNPC->scriptSpecialActionOverlayActive
+			&& overlaySpecialNPC->scriptSpecialActionOverlayElapsed == 0
+			&& overlaySpecialNPC->actionBeginTime == actionBeginTimeBeforeHiddenOverlay + 25;
+		overlaySpecialNPC->visibleVariableName.clear();
+		overlaySpecialNPC->advanceFrameForTest(overlaySpecialNPC->scriptSpecialActionOverlayDuration);
+		ok = check(firstOverlayStarted
+			&& secondOverlayStarted
+			&& failedRestartPreservedOverlay
+			&& firstOverlayDuration > 0
+			&& hiddenOverlayPaused
+			&& !overlaySpecialNPC->scriptSpecialActionOverlayActive
+			&& overlaySpecialNPC->scriptSpecialActionOverlayElapsed == overlaySpecialNPC->scriptSpecialActionOverlayDuration
+			&& overlaySpecialNPC->actionManager->getCurrentActionType() == acHide
+			&& overlaySpecialNPC->direction == 6
+			&& overlaySpecialNPC->getOffset().x == 7.0f
+			&& overlaySpecialNPC->getOffset().y == 9.0f
+			&& overlaySpecialNPC->stepList.size() == 1
+			&& overlaySpecialNPC->stepList.front() == Point{ 2, 3 }
+			&& overlaySpecialNPC->res.special.imageFile == "persistent-special.asf",
+			"YYCS/XJXQY special overlays restart without destroying the underlying action or path") && ok;
+	}
+	applyOriginalBehavior(gameManager.global, GAME_XJXQY);
+	auto interruptedOverlayNPC = std::make_shared<InMemorySpecialActionNPC>();
+	interruptedOverlayNPC->res.hurt.imagePackage = std::make_shared<IMPImage>();
+	interruptedOverlayNPC->res.hurt.imagePackage->directions = 1;
+	interruptedOverlayNPC->res.hurt.imagePackage->interval = 100;
+	interruptedOverlayNPC->res.hurt.imagePackage->frame.resize(1);
+	interruptedOverlayNPC->direction = 2;
+	interruptedOverlayNPC->startScriptSpecialAction("interrupted-overlay.asf");
+	interruptedOverlayNPC->direction = 7;
+	interruptedOverlayNPC->actionManager->resetActionIgnoringTransitions(acHurt);
+	interruptedOverlayNPC->advanceFrameForTest(50);
+	ok = check(interruptedOverlayNPC->scriptSpecialActionOverlayActive
+		&& interruptedOverlayNPC->scriptSpecialActionOverlaySupersededByAction
+		&& interruptedOverlayNPC->actionManager->getCurrentActionType() == acHurt
+		&& interruptedOverlayNPC->direction == 7,
+		"a new one-shot action visually supersedes a running YYCS/XJXQY special overlay") && ok;
+	interruptedOverlayNPC->advanceFrameForTest(50);
+	ok = check(!interruptedOverlayNPC->scriptSpecialActionOverlayActive
+		&& interruptedOverlayNPC->actionManager->getCurrentActionType() == acHurt
+		&& interruptedOverlayNPC->direction == 2,
+		"the replacement one-shot ends the YYCS/XJXQY special lifecycle and restores direction") && ok;
+	interruptedOverlayNPC->advanceFrameForTest(1);
+	ok = check(interruptedOverlayNPC->actionManager->getCurrentActionType() == acStand,
+		"the replacement one-shot completes through its normal action logic on the next frame") && ok;
+
+	auto attackingOverlayNPC = std::make_shared<InMemorySpecialActionNPC>();
+	// A successful attack needs a usable skill as well as an animation. This
+	// fixture tests overlay takeover, not an actor with no available attack.
+	attackingOverlayNPC->npcMagic = std::make_shared<Magic>();
+	attackingOverlayNPC->npcMagic->loadSucceeded = true;
+	attackingOverlayNPC->res.attack.imagePackage = std::make_shared<IMPImage>();
+	attackingOverlayNPC->res.attack.imagePackage->directions = 8;
+	attackingOverlayNPC->res.attack.imagePackage->interval = 100;
+	attackingOverlayNPC->res.attack.imagePackage->frame.resize(1);
+	attackingOverlayNPC->setPosition({ 3, 4 });
+	attackingOverlayNPC->direction = 2;
+	attackingOverlayNPC->startScriptSpecialAction("attack-interrupted-overlay.asf");
+	attackingOverlayNPC->beginAttack({ 4, 4 });
+	attackingOverlayNPC->advanceFrameForTest(50);
+	ok = check(attackingOverlayNPC->scriptSpecialActionOverlayActive
+		&& attackingOverlayNPC->scriptSpecialActionOverlaySupersededByAction
+		&& attackingOverlayNPC->actionManager->getCurrentActionType() == acAttack,
+		"a scripted attack takes over a running YYCS/XJXQY special overlay") && ok;
+	attackingOverlayNPC->advanceFrameForTest(50);
+	ok = check(!attackingOverlayNPC->scriptSpecialActionOverlayActive
+		&& attackingOverlayNPC->actionManager->getCurrentActionType() == acAttack
+		&& attackingOverlayNPC->direction == 2,
+		"the attack animation ends the special lifecycle before normal attack completion") && ok;
+	attackingOverlayNPC->advanceFrameForTest(1);
+	ok = check(attackingOverlayNPC->actionManager->getCurrentActionType() == acStand,
+		"the takeover attack releases and returns to stand on its normal completion frame") && ok;
+
+	applyOriginalBehavior(gameManager.global, GAME_YYCS);
+	auto blockingSpecialNPC = std::make_shared<BlockingInMemorySpecialActionNPC>();
+	blockingSpecialNPC->res.hurt.imagePackage = std::make_shared<IMPImage>();
+	blockingSpecialNPC->res.hurt.imagePackage->directions = 1;
+	blockingSpecialNPC->res.hurt.imagePackage->interval = 5000;
+	blockingSpecialNPC->res.hurt.imagePackage->frame.resize(1);
+	blockingSpecialNPC->actionManager->resetActionIgnoringTransitions(acHurt);
+	blockingSpecialNPC->doSpecialAction("yycs-blocking-special.asf");
+	ok = check(blockingSpecialNPC->actionManager->getCurrentActionType() == acHurt
+		&& !blockingSpecialNPC->scriptSpecialActionOverlayActive
+		&& blockingSpecialNPC->scriptSpecialActionOverlayDuration > 0
+		&& blockingSpecialNPC->scriptSpecialActionOverlayElapsed == blockingSpecialNPC->scriptSpecialActionOverlayDuration
+		&& !blockingSpecialNPC->eventRunUntilScriptSpecialActionEnds,
+		"blocking special actions return when the special animation ends, before a restored action ends") && ok;
+	applyOriginalBehavior(gameManager.global, GAME_JXQY2);
+	auto legacyBlockingSpecialNPC = std::make_shared<BlockingInMemorySpecialActionNPC>();
+	legacyBlockingSpecialNPC->actionManager->resetActionIgnoringTransitions(acHide);
+	legacyBlockingSpecialNPC->visibleVariableName = "$hidden-blocking-special";
+	legacyBlockingSpecialNPC->visibleVariableValue = 1;
+	legacyBlockingSpecialNPC->doSpecialAction("jxqy2-blocking-special.asf");
+	ok = check(legacyBlockingSpecialNPC->actionManager->getCurrentActionType() == acStand
+		&& !legacyBlockingSpecialNPC->isVisibleByVariable,
+		"JXQY2 hidden blocking special actions preserve main's return-to-stand behavior") && ok;
+
+	auto missingSpecialNPC = std::make_shared<InMemorySpecialActionNPC>();
+	missingSpecialNPC->provideResource = false;
+	missingSpecialNPC->doSpecialAction("missing-special.asf");
+	ok = check(missingSpecialNPC->loadCount == 1
+		&& missingSpecialNPC->loadedFileName == "missing-special.asf"
+		&& missingSpecialNPC->eventRunCount == 0
+		&& missingSpecialNPC->actionManager->getCurrentActionType() == acStand,
+		"missing special-action resources fail without waiting on the previous action") && ok;
+
+	gameManager.mapFolderName = "script-position-trap-test";
+	gameManager.global.data.mapName = "script-position-trap-test.map";
+	gameManager.map->data->tile[4][3].trap = 1;
+	gameManager.map->data->tile[4][5].trap = 2;
+	gameManager.traps.set(gameManager.mapFolderName, 1, "script-position-trap-1.lua");
+	gameManager.traps.set(gameManager.mapFolderName, 2, "script-position-trap-2.lua");
+	gameManager.camera->followPlayer = false;
+	gameManager.player->life = 100;
+	gameManager.inEvent = true;
+	gameManager.scriptTaskList.clear();
+	const int setPlayerPositionResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "setplayerpos(3, 4)");
+	ok = check(setPlayerPositionResult == LUA_OK
+		&& gameManager.player->getPosition() == Point{ 3, 4 }
+		&& gameManager.scriptTaskList.empty(),
+		"script SetPlayerPos places the player without queuing its landing trap") && ok;
+	ScriptEngineRuntimeTestAccess::updateGameManager(gameManager);
+	ok = check(gameManager.scriptTaskList.size() == 1
+		&& gameManager.scriptTaskList[0].type == stTraps
+		&& gameManager.scriptTaskList[0].trapIndex == 1,
+		"the next manager update queues the script placement trap behind its active parent") && ok;
+	gameManager.scriptTaskList.clear();
+	gameManager.player->setPosition({ 5, 4 }, false);
+	gameManager.player->checkTrap();
+	ok = check(gameManager.scriptTaskList.size() == 1
+		&& gameManager.scriptTaskList[0].type == stTraps
+		&& gameManager.scriptTaskList[0].trapIndex == 2,
+		"a non-script teleport to another tile still queues its landing trap") && ok;
+	gameManager.scriptTaskList.clear();
+	gameManager.inEvent = false;
+
+	gameManager.traps.markTriggered(1);
+	const int rearmCurrentTrapResult =
+		ScriptEngineRuntimeTestAccess::execute(
+			script,
+			"setmaptrap(1, \"rearmed-current-trap.lua\")");
+	ok = check(rearmCurrentTrapResult == LUA_OK
+		&& !gameManager.traps.hasTriggered(1)
+		&& gameManager.traps.get(
+			gameManager.mapFolderName,
+			1) == "rearmed-current-trap.lua",
+		"SetMapTrap replaces and rearms the current map trap index") && ok;
+
+	const int setMaximumTrapResult =
+		ScriptEngineRuntimeTestAccess::execute(
+			script,
+			"setmaptrap(255, \"maximum-trap.lua\")");
+	ok = check(setMaximumTrapResult == LUA_OK
+		&& gameManager.traps.get(
+			gameManager.mapFolderName,
+			255) == "maximum-trap.lua",
+		"SetMapTrap accepts the full byte-sized map trap range") && ok;
+	gameManager.traps.markTriggered(255);
+	const int removeMaximumTrapResult =
+		ScriptEngineRuntimeTestAccess::execute(
+			script,
+			"setmaptrap(255, \"\")");
+	ok = check(removeMaximumTrapResult == LUA_OK
+		&& !gameManager.traps.hasTriggered(255)
+		&& gameManager.traps.get(
+			gameManager.mapFolderName,
+			255).empty(),
+		"SetMapTrap removes an empty mapping and rearms its current-map index") && ok;
+
+	const int largeMapTimeResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "setmaptime(300)");
+	ok = check(largeMapTimeResult == LUA_OK
+		&& gameManager.global.data.mapTime == 300,
+		"SetMapTime preserves values above the byte range") && ok;
+	const int negativeMapTimeResult = ScriptEngineRuntimeTestAccess::execute(
+		script, "setmaptime(-1)");
+	ok = check(negativeMapTimeResult == LUA_OK
+		&& gameManager.global.data.mapTime == -1,
+		"SetMapTime preserves negative integer state like the reference runtime") && ok;
+	gameManager.scriptAPI.setMapTime(mtDay);
+
+	gameManager.traps.markTriggered(1);
+	const int rearmNamedCurrentTrapResult =
+		ScriptEngineRuntimeTestAccess::execute(
+			script,
+			"settrap(\"script-position-trap-test\", 1, \"rearmed-named-trap.lua\")");
+	ok = check(rearmNamedCurrentTrapResult == LUA_OK
+		&& !gameManager.traps.hasTriggered(1)
+		&& gameManager.traps.get(
+			gameManager.mapFolderName,
+			1) == "rearmed-named-trap.lua",
+		"SetTrap rearms an explicitly named current map") && ok;
+
+	gameManager.traps.markTriggered(1);
+	const int editOtherMapTrapResult =
+		ScriptEngineRuntimeTestAccess::execute(
+			script,
+			"settrap(\"another-map\", 1, \"another-map-trap.lua\")");
+	ok = check(editOtherMapTrapResult == LUA_OK
+		&& gameManager.traps.hasTriggered(1)
+		&& gameManager.traps.get(
+			"another-map",
+			1) == "another-map-trap.lua",
+		"SetTrap edits another map without rearming the current map index") && ok;
+
+	GameManager freeMapManager;
+	freeMapManager.mapFolderName = "free-map-trap-test";
+	freeMapManager.traps.set(
+		freeMapManager.mapFolderName,
+		1,
+		"retained-after-free-map.lua");
+	freeMapManager.traps.markTriggered(1);
+	freeMapManager.global.data.mapName = "free-map-trap-test.map";
+	freeMapManager.global.data.npcName = "retained.npc";
+	freeMapManager.global.data.objName = "retained.obj";
+	freeMapManager.global.data.rainFile = "retained-rain.ini";
+	freeMapManager.global.data.rainShow = true;
+	auto retainedFreeMapNpc = std::make_shared<NPC>();
+	auto retainedFreeMapObject = std::make_shared<Object>();
+	freeMapManager.npcManager->npcList.push_back(nullptr);
+	freeMapManager.objectManager->objectList.push_back(nullptr);
+	freeMapManager.scriptNPC = retainedFreeMapNpc;
+	freeMapManager.scriptObj = retainedFreeMapObject;
+	freeMapManager.camera->followPlayer = true;
+	freeMapManager.scriptAPI.freeMap();
+	ok = check(freeMapManager.traps.get(
+			"free-map-trap-test",
+			1) == "retained-after-free-map.lua"
+		&& freeMapManager.traps.hasTriggered(1)
+		&& freeMapManager.map->data == nullptr
+		&& freeMapManager.mapFolderName == "free-map-trap-test"
+		&& freeMapManager.global.data.mapName == "free-map-trap-test.map"
+		&& freeMapManager.global.data.npcName == "retained.npc"
+		&& freeMapManager.global.data.objName == "retained.obj"
+		&& freeMapManager.global.data.rainFile == "retained-rain.ini"
+		&& freeMapManager.global.data.rainShow
+		&& freeMapManager.npcManager->npcList.size() == 1
+		&& freeMapManager.npcManager->npcList.front() == nullptr
+		&& freeMapManager.objectManager->objectList.size() == 1
+		&& freeMapManager.objectManager->objectList.front() == nullptr
+		&& freeMapManager.scriptNPC == retainedFreeMapNpc
+		&& freeMapManager.scriptObj == retainedFreeMapObject
+		&& freeMapManager.camera->followPlayer,
+		"FreeMap releases only map data and preserves the reference runtime world state") && ok;
+
+	GameManager noCurrentMapManager;
+	noCurrentMapManager.scriptAPI.setMapTrap(1, "must-not-create-an-empty-map.lua");
+	noCurrentMapManager.scriptAPI.setTrap("", 2, "must-not-create-an-empty-map.lua");
+	ok = check(noCurrentMapManager.traps.get("", 1).empty()
+		&& noCurrentMapManager.traps.get("", 2).empty(),
+		"SetMapTrap and an unnamed SetTrap do nothing when no current map exists") && ok;
+
+	ScriptTask parallelTask;
+	parallelTask.type = stScript;
+	parallelTask.scriptName = "bounded-parallel.lua";
+	for (std::size_t index = 0; index < MaxParallelScriptStates; index++)
+	{
+		ok = check(gameManager.addScriptTask(parallelTask),
+			"parallel script tasks are accepted within the runtime limit") && ok;
+	}
+	ok = check(!gameManager.addScriptTask(parallelTask)
+		&& gameManager.scriptTaskList.size() == MaxParallelScriptStates,
+		"parallel script task scheduling is bounded before persistence") && ok;
+	ScriptTask interactionTask;
+	interactionTask.type = stTraps;
+	ok = check(gameManager.addScriptTask(interactionTask)
+		&& gameManager.scriptTaskList.size() == MaxParallelScriptStates + 1,
+		"parallel script limits do not discard non-script interaction tasks") && ok;
+
+	const std::string savedPlayerDeathScript = gameManager.player->deathScript;
+	const unsigned int savedPlayerResult = gameManager.player->result;
+	gameManager.player->deathScript.clear();
+	gameManager.player->result = erRunDeathScript;
+	gameManager.eventList.push_back(EventInfo{});
+	const bool playerDeathHandled =
+		ScriptEngineRuntimeTestAccess::runPendingPlayerDeathScript(gameManager);
+	ok = check(playerDeathHandled
+		&& (gameManager.player->result & erRunDeathScript) == 0
+		&& gameManager.eventList.empty()
+		&& gameManager.scriptTaskList.empty(),
+		"player death takes priority and discards same-frame NPC events and queued scripts") && ok;
+	ok = check(!ScriptEngineRuntimeTestAccess::runPendingPlayerDeathScript(gameManager),
+		"a consumed player death script is not dispatched twice") && ok;
+	gameManager.player->deathScript = savedPlayerDeathScript;
+	gameManager.player->result = savedPlayerResult;
+
+	GameManager titleGameManager;
+	titleGameManager.varList.ensureInitialized();
+	for (std::size_t index = 0; index < MaxParallelScriptStates; index++)
+	{
+		ok = check(titleGameManager.addScriptTask(parallelTask),
+			"parallel script tasks are queued in the active world before title exit") && ok;
+	}
+	ok = check(titleGameManager.addScriptTask(interactionTask),
+		"an interaction task is queued alongside parallel scripts before title exit") && ok;
+	const int returnToTitleResult = ScriptEngineRuntimeTestAccess::execute(
+		script,
+		"returntotitle(); assign('after_return_to_title', 7); returntotitle(123);");
+	ok = check(returnToTitleResult == LUA_OK &&
+		titleGameManager.varList.getInteger("after_return_to_title") == 7,
+		"ReturnToTitle requests scene exit without implicitly terminating the current script, and ignores extra arguments") && ok;
+	const std::size_t remainingParallelTasks = static_cast<std::size_t>(
+		std::count_if(
+			titleGameManager.scriptTaskList.begin(),
+			titleGameManager.scriptTaskList.end(),
+			[](const ScriptTask& task)
+			{
+				return task.type == stScript;
+			}));
+	ok = check(remainingParallelTasks == 0
+		&& titleGameManager.scriptTaskList.size() == 1
+		&& titleGameManager.scriptTaskList.front().type == stTraps
+		&& titleGameManager.result == erOK
+		&& !ScriptEngineRuntimeTestAccess::isLogicRunning(titleGameManager),
+		"ReturnToTitle clears YYCS/XJXQY parallel scripts before leaving the game") && ok;
+
+	return ok;
+}
